@@ -1,0 +1,1 @@
+//! amber-core crate root.
