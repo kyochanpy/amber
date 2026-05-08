@@ -1,0 +1,13 @@
+[package]
+name = "amber-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+amber-core = { path = "../amber-core" }
+anyhow.workspace = true
+dora-node-api.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
