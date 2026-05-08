@@ -1,0 +1,14 @@
+[package]
+name = "amber-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+amber-core = { path = "../amber-core" }
+anyhow.workspace = true
+clap.workspace = true
+datafusion.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
