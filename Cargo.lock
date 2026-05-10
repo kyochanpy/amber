@@ -98,6 +98,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow 53.4.1",
+ "bytes",
  "chrono",
  "futures",
  "image",
