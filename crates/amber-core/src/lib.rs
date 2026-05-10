@@ -1,6 +1,7 @@
 //! amber-core crate root.
 
 pub mod catalog;
+pub mod compactor;
 pub mod config;
 pub mod schema;
 pub mod session;
@@ -13,6 +14,7 @@ pub use catalog::{
     SchemaCatalogEntry, UuidV7Id, UuidV7IdError, WalSegmentClosedEvent, WalSegmentDeletedEvent,
     WalSegmentId,
 };
+pub use compactor::{Compactor, CompactorError};
 pub use config::{
     AmberConfig, CompactionConfig, ConfigError, NodeConfig, OutputConfig, StorageBackend,
     StorageConfig, WalConfig, WalRotationConfig,
