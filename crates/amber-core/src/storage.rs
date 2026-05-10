@@ -273,6 +273,54 @@ fn prefix_from_config(prefix: Option<&str>) -> Result<ObjectPath, StorageError> 
 
 pub mod paths {
     use super::ObjectPath;
+    use thiserror::Error;
+
+    #[derive(Debug, Error)]
+    pub enum PathComponentError {
+        #[error("invalid escaped path component '{value}': incomplete percent escape")]
+        IncompleteEscape { value: String },
+        #[error("invalid escaped path component '{value}': bad hex digits '{digits}'")]
+        InvalidHex { value: String, digits: String },
+        #[error("invalid escaped path component '{value}': {source}")]
+        InvalidUtf8 {
+            value: String,
+            #[source]
+            source: std::string::FromUtf8Error,
+        },
+    }
+
+    pub fn unescape_component(value: &str) -> Result<String, PathComponentError> {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                if index + 2 >= bytes.len() {
+                    return Err(PathComponentError::IncompleteEscape {
+                        value: value.to_owned(),
+                    });
+                }
+
+                let digits = &value[index + 1..index + 3];
+                let parsed =
+                    u8::from_str_radix(digits, 16).map_err(|_| PathComponentError::InvalidHex {
+                        value: value.to_owned(),
+                        digits: digits.to_owned(),
+                    })?;
+                decoded.push(parsed);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+
+        String::from_utf8(decoded).map_err(|source| PathComponentError::InvalidUtf8 {
+            value: value.to_owned(),
+            source,
+        })
+    }
 
     pub fn escape_component(value: &str) -> String {
         ObjectPath::from_iter([value]).to_string()
@@ -286,12 +334,12 @@ pub mod paths {
         session_root(session_id).child("manifest.json")
     }
 
-    pub fn wal_root(session_id: &str) -> ObjectPath {
+    pub fn session_wal_root(session_id: &str) -> ObjectPath {
         ObjectPath::from("wal").child(format!("session_id={session_id}"))
     }
 
     pub fn wal_stream_root(session_id: &str, node_id: &str, output_id: &str) -> ObjectPath {
-        wal_root(session_id)
+        session_wal_root(session_id)
             .child(format!("node_id={node_id}"))
             .child(format!("output_id={output_id}"))
     }
@@ -306,10 +354,14 @@ pub mod paths {
     }
 
     pub fn parquet_root(node_id: &str, output_id: &str, schema_fingerprint: &str) -> ObjectPath {
-        ObjectPath::from("parquet")
+        global_parquet_root()
             .child(format!("node_id={node_id}"))
             .child(format!("output_id={output_id}"))
             .child(format!("schema_fingerprint={schema_fingerprint}"))
+    }
+
+    pub fn global_parquet_root() -> ObjectPath {
+        ObjectPath::from("parquet")
     }
 
     pub fn parquet_file(
@@ -329,12 +381,12 @@ pub mod paths {
         catalog_events_prefix().child(file_name)
     }
 
-    pub fn schema_prefix() -> ObjectPath {
+    pub fn schema_catalog_dir() -> ObjectPath {
         ObjectPath::from_iter(["catalog", "schemas"])
     }
 
     pub fn schema_file(schema_fingerprint: &str) -> ObjectPath {
-        schema_prefix().child(format!("{schema_fingerprint}.arrow.json"))
+        schema_catalog_dir().child(format!("{schema_fingerprint}.arrow.json"))
     }
 }
 
@@ -458,8 +510,16 @@ mod tests {
     fn path_helpers_are_data_dir_relative_and_escape_segments() {
         assert_eq!(paths::escape_component("joint/states"), "joint%2Fstates");
         assert_eq!(
+            paths::unescape_component("joint%2Fstates").expect("component should decode"),
+            "joint/states"
+        );
+        assert_eq!(
             paths::session_manifest("20260509_abc123").as_ref(),
             "sessions/session_id=20260509_abc123/manifest.json"
+        );
+        assert_eq!(
+            paths::session_wal_root("20260509_abc123").as_ref(),
+            "wal/session_id=20260509_abc123"
         );
         assert_eq!(
             paths::wal_segment(
@@ -471,6 +531,7 @@ mod tests {
             .as_ref(),
             "wal/session_id=20260509_abc123/node_id=joint%2Fstates/output_id=state%2Fraw/segment-0001.arrow"
         );
+        assert_eq!(paths::global_parquet_root().as_ref(), "parquet");
         assert_eq!(
             paths::parquet_file("joint/states", "state/raw", "abc123", "part-0001.parquet")
                 .as_ref(),
@@ -484,5 +545,16 @@ mod tests {
             paths::schema_file("abc123").as_ref(),
             "catalog/schemas/abc123.arrow.json"
         );
+        assert_eq!(paths::schema_catalog_dir().as_ref(), "catalog/schemas");
+    }
+
+    #[test]
+    fn unescape_component_rejects_invalid_percent_encoding() {
+        let error =
+            paths::unescape_component("joint%2").expect_err("truncated percent escape should fail");
+        assert!(matches!(
+            error,
+            paths::PathComponentError::IncompleteEscape { .. }
+        ));
     }
 }
