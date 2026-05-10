@@ -5,6 +5,7 @@ pub mod config;
 pub mod schema;
 pub mod session;
 pub mod storage;
+pub mod writer;
 
 pub use catalog::{
     CatalogError, CatalogEvent, CatalogEventId, CatalogState, CompactionCommittedEvent,
@@ -29,3 +30,4 @@ pub use session::{
     SessionManifestError, SessionStatus,
 };
 pub use storage::{ObjectPath, Storage, StorageError, paths};
+pub use writer::{WalWriteReceipt, WalWriteRequest, WalWriter, WalWriterError, WriteCommand};

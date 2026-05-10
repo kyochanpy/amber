@@ -145,12 +145,12 @@ pub fn prepend_metadata_columns(
     }
 
     let row_count = batch.num_rows();
-    validate_metadata_len(
+    validate_metadata_column_len(
         NODE_TIMESTAMP_COLUMN,
         row_count,
         metadata.node_timestamps.len(),
     )?;
-    validate_metadata_len(
+    validate_metadata_column_len(
         AMBER_TIMESTAMP_COLUMN,
         row_count,
         metadata.amber_timestamps.len(),
@@ -374,18 +374,18 @@ fn normalize_time_unit(unit: TimeUnit) -> String {
     }
 }
 
-fn validate_metadata_len(
+fn validate_metadata_column_len(
     column_name: &'static str,
-    expected_len: usize,
-    actual_len: usize,
+    batch_row_count: usize,
+    metadata_value_count: usize,
 ) -> Result<(), MetadataColumnsError> {
-    if expected_len == actual_len {
+    if batch_row_count == metadata_value_count {
         Ok(())
     } else {
         Err(MetadataColumnsError::RowCountMismatch {
             column_name,
-            expected_len,
-            actual_len,
+            expected_len: batch_row_count,
+            actual_len: metadata_value_count,
         })
     }
 }
