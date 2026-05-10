@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_LOCAL_STORAGE_PATH: &str = "./amber_data";
@@ -11,7 +11,7 @@ const DEFAULT_WAL_ROTATION_MAX_SIZE_MB: u64 = 256;
 const DEFAULT_WAL_ROTATION_MAX_DURATION_SEC: u64 = 300;
 const DEFAULT_COMPACTION_TARGET_FILE_MB: u64 = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AmberConfig {
     #[serde(default)]
@@ -24,7 +24,7 @@ pub struct AmberConfig {
     pub nodes: Vec<NodeConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackend {
     Local,
@@ -50,7 +50,7 @@ impl fmt::Display for StorageBackend {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(default = "default_storage_backend")]
@@ -112,14 +112,14 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct WalConfig {
     #[serde(default)]
     pub rotation: WalRotationConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalRotationConfig {
     #[serde(default = "default_wal_rotation_max_size_mb")]
@@ -137,7 +137,7 @@ impl Default for WalRotationConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
     #[serde(default = "default_compaction_target_file_mb")]
@@ -152,7 +152,7 @@ impl Default for CompactionConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub id: String,
@@ -160,7 +160,7 @@ pub struct NodeConfig {
     pub outputs: Vec<OutputConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputConfig {
     pub id: String,
