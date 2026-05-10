@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit, UnionFields, UnionMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const SESSION_ID_COLUMN: &str = "session_id";
 pub const NODE_ID_COLUMN: &str = "node_id";
@@ -65,7 +65,9 @@ pub fn payload_fields(schema: &Schema) -> Vec<Field> {
 pub fn payload_schema(schema: &Schema) -> Schema {
     Schema::new_with_metadata(
         payload_fields(schema),
-        filter_semantic_metadata(&schema.metadata).into_iter().collect(),
+        filter_semantic_metadata(&schema.metadata)
+            .into_iter()
+            .collect(),
     )
 }
 
@@ -74,13 +76,13 @@ pub fn schema_fingerprint(schema: &Schema) -> String {
 }
 
 pub fn schema_fingerprint_for_payload(schema: &Schema) -> String {
-    let normalized = normalize_schema(schema);
+    let normalized = normalized_payload_schema(schema);
     let bytes = serde_json::to_vec(&normalized).expect("normalized schema should serialize");
     fnv1a128_hex(&bytes)
 }
 
-fn normalize_schema(schema: &Schema) -> NormalizedSchema {
-    NormalizedSchema {
+pub fn normalized_payload_schema(schema: &Schema) -> NormalizedPayloadSchema {
+    NormalizedPayloadSchema {
         fields: schema
             .fields
             .iter()
@@ -115,7 +117,7 @@ fn normalize_data_type(data_type: &DataType) -> NormalizedDataType {
         DataType::Float32 => leaf_type("float32"),
         DataType::Float64 => leaf_type("float64"),
         DataType::Timestamp(unit, timezone) => NormalizedDataType {
-            kind: "timestamp",
+            kind: "timestamp".to_owned(),
             params: map_from_pairs([
                 ("time_unit", normalize_time_unit(*unit)),
                 (
@@ -160,14 +162,14 @@ fn normalize_data_type(data_type: &DataType) -> NormalizedDataType {
         DataType::LargeList(field) => with_child("large_list", field.as_ref()),
         DataType::LargeListView(field) => with_child("large_list_view", field.as_ref()),
         DataType::Struct(fields) => NormalizedDataType {
-            kind: "struct",
+            kind: "struct".to_owned(),
             params: BTreeMap::new(),
             children: normalize_fields(fields),
             union_mode: None,
             union_type_ids: Vec::new(),
         },
         DataType::Union(fields, mode) => NormalizedDataType {
-            kind: "union",
+            kind: "union".to_owned(),
             params: BTreeMap::new(),
             children: normalize_union_fields(fields),
             union_mode: Some(match mode {
@@ -177,7 +179,7 @@ fn normalize_data_type(data_type: &DataType) -> NormalizedDataType {
             union_type_ids: fields.iter().map(|(type_id, _)| type_id).collect(),
         },
         DataType::Dictionary(key, value) => NormalizedDataType {
-            kind: "dictionary",
+            kind: "dictionary".to_owned(),
             params: BTreeMap::new(),
             children: vec![
                 NormalizedField {
@@ -197,7 +199,7 @@ fn normalize_data_type(data_type: &DataType) -> NormalizedDataType {
             union_type_ids: Vec::new(),
         },
         DataType::Decimal128(precision, scale) => NormalizedDataType {
-            kind: "decimal128",
+            kind: "decimal128".to_owned(),
             params: map_from_pairs([
                 ("precision", precision.to_string()),
                 ("scale", scale.to_string()),
@@ -207,7 +209,7 @@ fn normalize_data_type(data_type: &DataType) -> NormalizedDataType {
             union_type_ids: Vec::new(),
         },
         DataType::Decimal256(precision, scale) => NormalizedDataType {
-            kind: "decimal256",
+            kind: "decimal256".to_owned(),
             params: map_from_pairs([
                 ("precision", precision.to_string()),
                 ("scale", scale.to_string()),
@@ -217,14 +219,14 @@ fn normalize_data_type(data_type: &DataType) -> NormalizedDataType {
             union_type_ids: Vec::new(),
         },
         DataType::Map(field, keys_sorted) => NormalizedDataType {
-            kind: "map",
+            kind: "map".to_owned(),
             params: map_from_pairs([("keys_sorted", keys_sorted.to_string())]),
             children: vec![normalize_field(field.as_ref())],
             union_mode: None,
             union_type_ids: Vec::new(),
         },
         DataType::RunEndEncoded(run_ends, values) => NormalizedDataType {
-            kind: "run_end_encoded",
+            kind: "run_end_encoded".to_owned(),
             params: BTreeMap::new(),
             children: vec![
                 normalize_field(run_ends.as_ref()),
@@ -273,7 +275,7 @@ fn is_semantic_metadata_key(key: &str) -> bool {
 
 fn leaf_type(kind: &'static str) -> NormalizedDataType {
     NormalizedDataType {
-        kind,
+        kind: kind.to_owned(),
         params: BTreeMap::new(),
         children: Vec::new(),
         union_mode: None,
@@ -283,7 +285,7 @@ fn leaf_type(kind: &'static str) -> NormalizedDataType {
 
 fn with_param(kind: &'static str, key: &'static str, value: String) -> NormalizedDataType {
     NormalizedDataType {
-        kind,
+        kind: kind.to_owned(),
         params: map_from_pairs([(key, value)]),
         children: Vec::new(),
         union_mode: None,
@@ -293,7 +295,7 @@ fn with_param(kind: &'static str, key: &'static str, value: String) -> Normalize
 
 fn with_child(kind: &'static str, field: &Field) -> NormalizedDataType {
     NormalizedDataType {
-        kind,
+        kind: kind.to_owned(),
         params: BTreeMap::new(),
         children: vec![normalize_field(field)],
         union_mode: None,
@@ -321,27 +323,27 @@ fn fnv1a128_hex(bytes: &[u8]) -> String {
     format!("{hash:032x}")
 }
 
-#[derive(Debug, Serialize)]
-struct NormalizedSchema {
-    fields: Vec<NormalizedField>,
-    metadata: BTreeMap<String, String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedPayloadSchema {
+    pub fields: Vec<NormalizedField>,
+    pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
-struct NormalizedField {
-    name: String,
-    nullable: bool,
-    data_type: NormalizedDataType,
-    metadata: BTreeMap<String, String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedField {
+    pub name: String,
+    pub nullable: bool,
+    pub data_type: NormalizedDataType,
+    pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
-struct NormalizedDataType {
-    kind: &'static str,
-    params: BTreeMap<String, String>,
-    children: Vec<NormalizedField>,
-    union_mode: Option<String>,
-    union_type_ids: Vec<i8>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedDataType {
+    pub kind: String,
+    pub params: BTreeMap<String, String>,
+    pub children: Vec<NormalizedField>,
+    pub union_mode: Option<String>,
+    pub union_type_ids: Vec<i8>,
 }
 
 #[cfg(test)]
