@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -67,6 +70,19 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
+    fn resolve_path_relative_to(&mut self, config_dir: &Path) {
+        if self.backend != StorageBackend::Local {
+            return;
+        }
+
+        let path = self.path.clone().unwrap_or_else(default_local_storage_path);
+        self.path = Some(if path.is_relative() {
+            config_dir.join(path)
+        } else {
+            path
+        });
+    }
+
     pub fn ensure_supported(&self) -> Result<(), ConfigError> {
         if self.backend.is_supported() {
             Ok(())
@@ -78,9 +94,7 @@ impl StorageConfig {
     }
 
     pub fn resolved_local_path(&self) -> PathBuf {
-        self.path
-            .clone()
-            .unwrap_or_else(default_local_storage_path)
+        self.path.clone().unwrap_or_else(default_local_storage_path)
     }
 }
 
@@ -156,8 +170,26 @@ pub struct OutputConfig {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("failed to read config file '{}': {source}", path.display())]
+    ReadConfigFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse config file '{}': {source}", path.display())]
+    ParseConfigFile {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
     #[error("storage backend '{backend}' is not supported; only 'local' is currently available")]
     UnsupportedStorageBackend { backend: StorageBackend },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AmberFile {
+    amber: AmberConfig,
 }
 
 fn default_storage_backend() -> StorageBackend {
@@ -180,14 +212,57 @@ fn default_compaction_target_file_mb() -> u64 {
     DEFAULT_COMPACTION_TARGET_FILE_MB
 }
 
+impl AmberConfig {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let contents = fs::read_to_string(path).map_err(|source| ConfigError::ReadConfigFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let file: AmberFile =
+            serde_yaml::from_str(&contents).map_err(|source| ConfigError::ParseConfigFile {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        let mut config = file.amber;
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        config.storage.resolve_path_relative_to(config_dir);
+        config.storage.ensure_supported()?;
+
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct AmberFile {
-        amber: AmberConfig,
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("amber-config-test-{unique}"));
+            fs::create_dir_all(&path).expect("temp dir should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
@@ -248,5 +323,95 @@ amber:
             err.to_string(),
             "storage backend 's3' is not supported; only 'local' is currently available"
         );
+    }
+
+    #[test]
+    fn from_file_loads_yaml_and_applies_defaults() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("amber.yaml");
+        fs::write(
+            &config_path,
+            r#"
+amber:
+  storage:
+    backend: local
+  compaction:
+    target_file_mb: 512
+"#,
+        )
+        .expect("config file should be written");
+
+        let config = AmberConfig::from_file(&config_path).expect("config should load");
+
+        assert_eq!(config.storage.backend, StorageBackend::Local);
+        assert_eq!(
+            config.storage.path,
+            Some(temp_dir.path().join("amber_data"))
+        );
+        assert_eq!(config.wal.rotation.max_size_mb, 256);
+        assert_eq!(config.wal.rotation.max_duration_sec, 300);
+        assert_eq!(config.compaction.target_file_mb, 512);
+        assert!(config.nodes.is_empty());
+    }
+
+    #[test]
+    fn from_file_resolves_relative_storage_path_from_config_directory() {
+        let temp_dir = TestDir::new();
+        let config_dir = temp_dir.path().join("configs");
+        let config_path = config_dir.join("amber.yaml");
+        fs::create_dir_all(&config_dir).expect("config dir should be created");
+        fs::write(
+            &config_path,
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./data
+"#,
+        )
+        .expect("config file should be written");
+
+        let config = AmberConfig::from_file(&config_path).expect("config should load");
+
+        assert_eq!(config.storage.path, Some(config_dir.join("data")));
+    }
+
+    #[test]
+    fn from_file_reports_parse_errors_with_path_context() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("broken.yaml");
+        fs::write(
+            &config_path,
+            r#"
+amber:
+  storage:
+    backend: [
+"#,
+        )
+        .expect("config file should be written");
+
+        let error = AmberConfig::from_file(&config_path).expect_err("config should fail");
+        let message = error.to_string();
+
+        assert!(message.contains(config_path.to_string_lossy().as_ref()));
+        assert!(message.contains("failed to parse config file"));
+    }
+
+    #[test]
+    fn from_file_reports_io_errors_with_path_context() {
+        let temp_dir = TestDir::new();
+        let config_path = temp_dir.path().join("missing.yaml");
+
+        let error = AmberConfig::from_file(&config_path).expect_err("config should fail");
+        let message = error.to_string();
+
+        assert!(matches!(
+            error,
+            ConfigError::ReadConfigFile {
+                path,
+                source: _,
+            } if path == config_path
+        ));
+        assert!(message.contains("failed to read config file"));
     }
 }
