@@ -237,33 +237,7 @@ impl AmberConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl TestDir {
-        fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("amber-config-test-{unique}"));
-            fs::create_dir_all(&path).expect("temp dir should be created");
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
+    use tempfile::TempDir;
 
     #[test]
     fn yaml_defaults_local_storage_and_sizes() {
@@ -327,7 +301,7 @@ amber:
 
     #[test]
     fn from_file_loads_yaml_and_applies_defaults() {
-        let temp_dir = TestDir::new();
+        let temp_dir = TempDir::new().expect("temp dir should be created");
         let config_path = temp_dir.path().join("amber.yaml");
         fs::write(
             &config_path,
@@ -356,7 +330,7 @@ amber:
 
     #[test]
     fn from_file_resolves_relative_storage_path_from_config_directory() {
-        let temp_dir = TestDir::new();
+        let temp_dir = TempDir::new().expect("temp dir should be created");
         let config_dir = temp_dir.path().join("configs");
         let config_path = config_dir.join("amber.yaml");
         fs::create_dir_all(&config_dir).expect("config dir should be created");
@@ -378,7 +352,7 @@ amber:
 
     #[test]
     fn from_file_reports_parse_errors_with_path_context() {
-        let temp_dir = TestDir::new();
+        let temp_dir = TempDir::new().expect("temp dir should be created");
         let config_path = temp_dir.path().join("broken.yaml");
         fs::write(
             &config_path,
@@ -399,7 +373,7 @@ amber:
 
     #[test]
     fn from_file_reports_io_errors_with_path_context() {
-        let temp_dir = TestDir::new();
+        let temp_dir = TempDir::new().expect("temp dir should be created");
         let config_path = temp_dir.path().join("missing.yaml");
 
         let error = AmberConfig::from_file(&config_path).expect_err("config should fail");
