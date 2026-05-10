@@ -1203,6 +1203,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_closes_all_open_streams_and_publishes_two_catalog_events() {
+        let storage_dir = TempDir::new().expect("storage dir should be created");
+        let staging_dir = TempDir::new().expect("staging dir should be created");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+        let session_id = SessionId::new();
+        SessionManifest::create(&storage, session_id.clone(), Utc::now(), test_config())
+            .await
+            .expect("manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "joint_states",
+                "state",
+                "schema-v1",
+                metadata_enriched_batch(vec![1], vec![Some("a")], vec![100], vec![110]),
+            ))
+            .await
+            .expect("joint_states write should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch(vec![7], vec![Some("frame")], vec![150], vec![160]),
+            ))
+            .await
+            .expect("camera write should succeed");
+
+        writer.shutdown().await.expect("shutdown should succeed");
+
+        let events = CatalogEvent::list(&storage)
+            .await
+            .expect("catalog events should load");
+        assert_eq!(events.len(), 2);
+
+        let catalog = CatalogState::load(&storage)
+            .await
+            .expect("catalog should load after shutdown");
+        assert_eq!(catalog.wal_segments.len(), 2);
+        assert!(
+            catalog
+                .wal_segments
+                .values()
+                .any(|segment| segment.node_id == "joint_states" && segment.output_id == "state")
+        );
+        assert!(
+            catalog
+                .wal_segments
+                .values()
+                .any(|segment| segment.node_id == "camera" && segment.output_id == "image")
+        );
+
+        let manifest = SessionManifest::load(&storage, &session_id)
+            .await
+            .expect("manifest should reload");
+        assert_eq!(manifest.observed_streams.len(), 2);
+        assert!(
+            manifest
+                .observed_streams
+                .iter()
+                .any(|stream| stream.node_id == "camera" && stream.output_id == "image")
+        );
+    }
+
+    #[tokio::test]
     async fn rotate_closes_only_target_stream_and_next_write_opens_new_segment() {
         let storage_dir = TempDir::new().expect("storage dir should be created");
         let staging_dir = TempDir::new().expect("staging dir should be created");
