@@ -7,7 +7,7 @@ use uuid::{Uuid, Version};
 
 use crate::{
     SessionId, Storage, StorageError,
-    schema::{NormalizedPayloadSchema, normalized_payload_schema},
+    schema::NormalizedPayloadSchema,
     storage::{ObjectPath, paths},
 };
 
@@ -472,6 +472,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use chrono::{Duration, TimeZone};
     use tempfile::TempDir;
+
+    use crate::normalized_payload_schema;
 
     use super::*;
     #[test]
