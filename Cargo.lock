@@ -119,7 +119,10 @@ version = "0.1.0"
 dependencies = [
  "amber-core",
  "anyhow",
+ "arrow 53.4.1",
+ "chrono",
  "dora-node-api",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
