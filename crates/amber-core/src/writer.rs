@@ -70,6 +70,19 @@ impl WalWriter {
         }
     }
 
+    pub async fn rotate(
+        &self,
+        request: WalRotateRequest,
+    ) -> Result<WalRotateReceipt, WalWriterError> {
+        match self.send_command(WriteCommand::Rotate(request)).await? {
+            CommandResult::Rotated(receipt) => Ok(receipt),
+            _ => Err(WalWriterError::UnexpectedResponse {
+                expected: "rotate",
+                actual: "non-rotate",
+            }),
+        }
+    }
+
     pub async fn shutdown(&mut self) -> Result<(), WalWriterError> {
         if self.is_shutdown {
             return self.await_join().await;
@@ -124,6 +137,7 @@ impl WalWriter {
 pub enum WriteCommand {
     Write(WalWriteRequest),
     Flush,
+    Rotate(WalRotateRequest),
     Shutdown,
 }
 
@@ -131,6 +145,7 @@ pub enum WriteCommand {
 enum CommandResult {
     Write(WalWriteReceipt),
     Flushed,
+    Rotated(WalRotateReceipt),
     Shutdown,
 }
 
@@ -166,6 +181,34 @@ pub struct WalWriteReceipt {
     pub segment_id: WalSegmentId,
     pub path: ObjectPath,
     pub row_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalRotateRequest {
+    pub session_id: SessionId,
+    pub node_id: String,
+    pub output_id: String,
+}
+
+impl WalRotateRequest {
+    pub fn new(
+        session_id: SessionId,
+        node_id: impl Into<String>,
+        output_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id,
+            node_id: node_id.into(),
+            output_id: output_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalRotateReceipt {
+    pub rotated: bool,
+    pub segment_id: Option<WalSegmentId>,
+    pub path: Option<ObjectPath>,
 }
 
 #[derive(Debug, Error)]
@@ -416,6 +459,9 @@ async fn handle_command(
             flush_segments(open_segments).await?;
             Ok(CommandResult::Flushed)
         }
+        WriteCommand::Rotate(request) => handle_rotate(storage, open_segments, request)
+            .await
+            .map(CommandResult::Rotated),
         WriteCommand::Shutdown => {
             shutdown_segments(storage, open_segments).await?;
             Ok(CommandResult::Shutdown)
@@ -505,6 +551,44 @@ async fn shutdown_segments(
         closed_segments.push(segment.close(storage).await?);
     }
 
+    publish_closed_segments(storage, closed_segments).await
+}
+
+async fn handle_rotate(
+    storage: &Storage,
+    open_segments: &mut HashMap<WalStreamKey, OpenWalSegment>,
+    request: WalRotateRequest,
+) -> Result<WalRotateReceipt, WalWriterError> {
+    let key = WalStreamKey {
+        session_id: request.session_id,
+        node_id: request.node_id,
+        output_id: request.output_id,
+    };
+
+    let Some(segment) = open_segments.remove(&key) else {
+        return Ok(WalRotateReceipt {
+            rotated: false,
+            segment_id: None,
+            path: None,
+        });
+    };
+
+    let segment_id = segment.segment_id.clone();
+    let path = segment.path.clone();
+    let closed_segment = segment.close(storage).await?;
+    publish_closed_segments(storage, vec![closed_segment]).await?;
+
+    Ok(WalRotateReceipt {
+        rotated: true,
+        segment_id: Some(segment_id),
+        path: Some(path),
+    })
+}
+
+async fn publish_closed_segments(
+    storage: &Storage,
+    closed_segments: Vec<ClosedWalSegment>,
+) -> Result<(), WalWriterError> {
     let mut updates_by_session = HashMap::<SessionId, Vec<ClosedWalStreamUpdate>>::new();
     for closed in &closed_segments {
         CatalogEvent::WalSegmentClosed(closed.event.clone())
@@ -1116,6 +1200,208 @@ mod tests {
         assert_eq!(observed.schema_fingerprints, vec!["schema-v1".to_owned()]);
         assert_eq!(observed.row_count, Some(3));
         assert_eq!(observed.byte_size, Some(closed_segment.byte_size));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_all_open_streams_and_publishes_two_catalog_events() {
+        let storage_dir = TempDir::new().expect("storage dir should be created");
+        let staging_dir = TempDir::new().expect("staging dir should be created");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+        let session_id = SessionId::new();
+        SessionManifest::create(&storage, session_id.clone(), Utc::now(), test_config())
+            .await
+            .expect("manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "joint_states",
+                "state",
+                "schema-v1",
+                metadata_enriched_batch(vec![1], vec![Some("a")], vec![100], vec![110]),
+            ))
+            .await
+            .expect("joint_states write should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch(vec![7], vec![Some("frame")], vec![150], vec![160]),
+            ))
+            .await
+            .expect("camera write should succeed");
+
+        writer.shutdown().await.expect("shutdown should succeed");
+
+        let events = CatalogEvent::list(&storage)
+            .await
+            .expect("catalog events should load");
+        assert_eq!(events.len(), 2);
+
+        let catalog = CatalogState::load(&storage)
+            .await
+            .expect("catalog should load after shutdown");
+        assert_eq!(catalog.wal_segments.len(), 2);
+        assert!(
+            catalog
+                .wal_segments
+                .values()
+                .any(|segment| segment.node_id == "joint_states" && segment.output_id == "state")
+        );
+        assert!(
+            catalog
+                .wal_segments
+                .values()
+                .any(|segment| segment.node_id == "camera" && segment.output_id == "image")
+        );
+
+        let manifest = SessionManifest::load(&storage, &session_id)
+            .await
+            .expect("manifest should reload");
+        assert_eq!(manifest.observed_streams.len(), 2);
+        assert!(
+            manifest
+                .observed_streams
+                .iter()
+                .any(|stream| stream.node_id == "camera" && stream.output_id == "image")
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_closes_only_target_stream_and_next_write_opens_new_segment() {
+        let storage_dir = TempDir::new().expect("storage dir should be created");
+        let staging_dir = TempDir::new().expect("staging dir should be created");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+        let session_id = SessionId::new();
+        SessionManifest::create(&storage, session_id.clone(), Utc::now(), test_config())
+            .await
+            .expect("manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        let first = writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "joint_states",
+                "state",
+                "schema-v1",
+                metadata_enriched_batch(vec![1], vec![Some("a")], vec![100], vec![110]),
+            ))
+            .await
+            .expect("first write should succeed");
+        let other = writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch(vec![7], vec![Some("frame")], vec![150], vec![160]),
+            ))
+            .await
+            .expect("other stream write should succeed");
+
+        let rotate = writer
+            .rotate(WalRotateRequest::new(
+                session_id.clone(),
+                "joint_states",
+                "state",
+            ))
+            .await
+            .expect("rotate should succeed");
+
+        assert!(rotate.rotated);
+        assert_eq!(rotate.segment_id, Some(first.segment_id.clone()));
+        assert_eq!(rotate.path, Some(first.path.clone()));
+        assert!(
+            storage
+                .exists(&first.path)
+                .await
+                .expect("rotated segment should be published")
+        );
+
+        let second = writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "joint_states",
+                "state",
+                "schema-v1",
+                metadata_enriched_batch(vec![2], vec![Some("b")], vec![200], vec![210]),
+            ))
+            .await
+            .expect("second write should succeed");
+
+        assert_ne!(first.segment_id, second.segment_id);
+        assert_ne!(first.path, second.path);
+        assert_eq!(second.row_count, 1);
+        assert!(
+            !storage
+                .exists(&second.path)
+                .await
+                .expect("new open segment should remain unpublished")
+        );
+        assert!(
+            !storage
+                .exists(&other.path)
+                .await
+                .expect("unrelated open segment should remain unpublished")
+        );
+
+        let catalog = CatalogState::load(&storage)
+            .await
+            .expect("catalog should load after rotate");
+        assert_eq!(catalog.wal_segments.len(), 1);
+        let rotated_segment = catalog
+            .wal_segments
+            .values()
+            .next()
+            .expect("rotated segment should be recorded");
+        assert_eq!(rotated_segment.segment_id, first.segment_id);
+        assert_eq!(rotated_segment.row_count, 1);
+
+        let manifest = SessionManifest::load(&storage, &session_id)
+            .await
+            .expect("manifest should reload");
+        assert_eq!(manifest.observed_streams.len(), 1);
+        assert_eq!(manifest.observed_streams[0].node_id, "joint_states");
+        assert_eq!(manifest.observed_streams[0].output_id, "state");
+
+        writer.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn rotate_is_noop_for_missing_stream() {
+        let storage_dir = TempDir::new().expect("storage dir should be created");
+        let staging_dir = TempDir::new().expect("staging dir should be created");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+        let session_id = SessionId::new();
+        SessionManifest::create(&storage, session_id.clone(), Utc::now(), test_config())
+            .await
+            .expect("manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        let receipt = writer
+            .rotate(WalRotateRequest::new(session_id, "missing", "stream"))
+            .await
+            .expect("rotate should succeed");
+
+        assert_eq!(
+            receipt,
+            WalRotateReceipt {
+                rotated: false,
+                segment_id: None,
+                path: None,
+            }
+        );
+        assert!(
+            CatalogEvent::list(&storage)
+                .await
+                .expect("catalog list should work")
+                .is_empty()
+        );
+
+        writer.shutdown().await.expect("shutdown should succeed");
     }
 
     #[test]

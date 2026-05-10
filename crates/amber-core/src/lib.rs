@@ -30,4 +30,7 @@ pub use session::{
     SessionManifestError, SessionStatus,
 };
 pub use storage::{ObjectPath, Storage, StorageError, paths};
-pub use writer::{WalWriteReceipt, WalWriteRequest, WalWriter, WalWriterError, WriteCommand};
+pub use writer::{
+    WalRotateReceipt, WalRotateRequest, WalWriteReceipt, WalWriteRequest, WalWriter,
+    WalWriterError, WriteCommand,
+};
