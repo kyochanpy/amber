@@ -11,8 +11,6 @@ use tokio::{
 };
 use tracing::warn;
 
-const SUPPORTED_DEFAULT_MAX_SIZE_MB: u64 = 256;
-
 fn main() {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,11 +51,11 @@ impl WalRotationRuntime {
         rotation: &WalRotationConfig,
         writer: Arc<WalWriter>,
     ) -> Result<Option<Self>> {
-        if rotation.max_size_mb != SUPPORTED_DEFAULT_MAX_SIZE_MB {
+        if rotation.max_size_mb != WalRotationConfig::DEFAULT_MAX_SIZE_MB {
             bail!(
                 "WAL size-based rotation is not yet supported in amber-node; configured max_size_mb={} (only the default placeholder value {} is currently accepted)",
                 rotation.max_size_mb,
-                SUPPORTED_DEFAULT_MAX_SIZE_MB
+                WalRotationConfig::DEFAULT_MAX_SIZE_MB
             );
         }
 

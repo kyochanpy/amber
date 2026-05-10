@@ -137,6 +137,11 @@ impl Default for WalRotationConfig {
     }
 }
 
+impl WalRotationConfig {
+    pub const DEFAULT_MAX_SIZE_MB: u64 = DEFAULT_WAL_ROTATION_MAX_SIZE_MB;
+    pub const DEFAULT_MAX_DURATION_SEC: u64 = DEFAULT_WAL_ROTATION_MAX_DURATION_SEC;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
