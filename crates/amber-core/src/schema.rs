@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit, UnionFields, UnionMode};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub const SESSION_ID_COLUMN: &str = "session_id";
 pub const NODE_ID_COLUMN: &str = "node_id";
@@ -79,6 +82,116 @@ pub fn schema_fingerprint_for_payload(schema: &Schema) -> String {
     let normalized = normalized_payload_schema(schema);
     let bytes = serde_json::to_vec(&normalized).expect("normalized schema should serialize");
     fnv1a128_hex(&bytes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordBatchMetadata {
+    pub session_id: String,
+    pub node_id: String,
+    pub output_id: String,
+    pub node_timestamps: Vec<i64>,
+    pub amber_timestamps: Vec<i64>,
+}
+
+impl RecordBatchMetadata {
+    pub fn new(
+        session_id: impl Into<String>,
+        node_id: impl Into<String>,
+        output_id: impl Into<String>,
+        node_timestamps: Vec<i64>,
+        amber_timestamps: Vec<i64>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            node_id: node_id.into(),
+            output_id: output_id.into(),
+            node_timestamps,
+            amber_timestamps,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum MetadataColumnsError {
+    #[error(
+        "payload schema contains reserved metadata column '{column_name}' and cannot be metadata-prefixed"
+    )]
+    ReservedColumnName { column_name: String },
+    #[error(
+        "metadata column '{column_name}' has {actual_len} rows but payload batch has {expected_len}"
+    )]
+    RowCountMismatch {
+        column_name: &'static str,
+        expected_len: usize,
+        actual_len: usize,
+    },
+    #[error("failed to build metadata-prefixed record batch: {source}")]
+    BuildRecordBatch {
+        #[source]
+        source: arrow::error::ArrowError,
+    },
+}
+
+pub fn prepend_metadata_columns(
+    batch: &RecordBatch,
+    metadata: &RecordBatchMetadata,
+) -> Result<RecordBatch, MetadataColumnsError> {
+    for field in batch.schema().fields() {
+        if is_metadata_column(field.name()) {
+            return Err(MetadataColumnsError::ReservedColumnName {
+                column_name: field.name().to_owned(),
+            });
+        }
+    }
+
+    let row_count = batch.num_rows();
+    validate_metadata_len(
+        NODE_TIMESTAMP_COLUMN,
+        row_count,
+        metadata.node_timestamps.len(),
+    )?;
+    validate_metadata_len(
+        AMBER_TIMESTAMP_COLUMN,
+        row_count,
+        metadata.amber_timestamps.len(),
+    )?;
+
+    let metadata_arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec![
+            metadata.session_id.as_str();
+            row_count
+        ])),
+        Arc::new(StringArray::from(vec![
+            metadata.node_id.as_str();
+            row_count
+        ])),
+        Arc::new(StringArray::from(vec![
+            metadata.output_id.as_str();
+            row_count
+        ])),
+        Arc::new(Int64Array::from(metadata.node_timestamps.clone())),
+        Arc::new(Int64Array::from(metadata.amber_timestamps.clone())),
+    ];
+
+    let mut fields = metadata_fields();
+    fields.extend(
+        batch
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.as_ref().clone()),
+    );
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        batch.schema().metadata.clone(),
+    ));
+
+    let mut columns = metadata_arrays;
+    columns.extend(batch.columns().iter().cloned());
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|source| MetadataColumnsError::BuildRecordBatch { source })
 }
 
 pub fn normalized_payload_schema(schema: &Schema) -> NormalizedPayloadSchema {
@@ -261,6 +374,22 @@ fn normalize_time_unit(unit: TimeUnit) -> String {
     }
 }
 
+fn validate_metadata_len(
+    column_name: &'static str,
+    expected_len: usize,
+    actual_len: usize,
+) -> Result<(), MetadataColumnsError> {
+    if expected_len == actual_len {
+        Ok(())
+    } else {
+        Err(MetadataColumnsError::RowCountMismatch {
+            column_name,
+            expected_len,
+            actual_len,
+        })
+    }
+}
+
 fn filter_semantic_metadata(metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
     metadata
         .iter()
@@ -349,9 +478,11 @@ pub struct NormalizedDataType {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
-    use arrow::datatypes::{Field, Schema, UnionFields};
+    use arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::{Field, Schema, UnionFields},
+    };
 
     use super::*;
 
@@ -499,5 +630,128 @@ mod tests {
             schema_fingerprint_for_payload(&Schema::new(vec![union_a])),
             schema_fingerprint_for_payload(&Schema::new(vec![union_b]))
         );
+    }
+
+    #[test]
+    fn prepend_metadata_columns_prefixes_batch_and_preserves_payload_order() {
+        let payload = RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                vec![
+                    Field::new("value", DataType::Int32, false),
+                    Field::new("label", DataType::Utf8, true),
+                ],
+                HashMap::from([("semantic_type".to_owned(), "pose".to_owned())]),
+            )),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+            ],
+        )
+        .unwrap();
+
+        let enriched = prepend_metadata_columns(
+            &payload,
+            &RecordBatchMetadata::new(
+                "session-1",
+                "node-a",
+                "output-x",
+                vec![10, 20],
+                vec![11, 21],
+            ),
+        )
+        .unwrap();
+
+        let names = enriched
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                SESSION_ID_COLUMN.to_owned(),
+                NODE_ID_COLUMN.to_owned(),
+                OUTPUT_ID_COLUMN.to_owned(),
+                NODE_TIMESTAMP_COLUMN.to_owned(),
+                AMBER_TIMESTAMP_COLUMN.to_owned(),
+                "value".to_owned(),
+                "label".to_owned(),
+            ]
+        );
+
+        assert_eq!(enriched.schema().metadata(), payload.schema().metadata());
+        assert_eq!(enriched.num_rows(), 2);
+    }
+
+    #[test]
+    fn prepend_metadata_columns_rejects_reserved_payload_names() {
+        let payload = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                SESSION_ID_COLUMN,
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+
+        let error = prepend_metadata_columns(
+            &payload,
+            &RecordBatchMetadata::new("session-1", "node-a", "output-x", vec![10], vec![11]),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MetadataColumnsError::ReservedColumnName { column_name }
+            if column_name == SESSION_ID_COLUMN
+        ));
+    }
+
+    #[test]
+    fn prepend_metadata_columns_rejects_row_count_mismatches() {
+        let payload = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+
+        let error = prepend_metadata_columns(
+            &payload,
+            &RecordBatchMetadata::new("session-1", "node-a", "output-x", vec![10], vec![11, 21]),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MetadataColumnsError::RowCountMismatch {
+                column_name: NODE_TIMESTAMP_COLUMN,
+                expected_len: 2,
+                actual_len: 1,
+            }
+        ));
+    }
+
+    #[test]
+    fn prepend_metadata_columns_supports_empty_batches() {
+        let payload = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )])));
+
+        let enriched = prepend_metadata_columns(
+            &payload,
+            &RecordBatchMetadata::new("session-1", "node-a", "output-x", Vec::new(), Vec::new()),
+        )
+        .unwrap();
+
+        assert_eq!(enriched.num_rows(), 0);
+        assert_eq!(enriched.num_columns(), 6);
     }
 }
