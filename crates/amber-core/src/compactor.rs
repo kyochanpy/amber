@@ -84,6 +84,45 @@ impl Compactor {
         Ok(Some(event))
     }
 
+    pub async fn cleanup_compacted(
+        &self,
+    ) -> Result<Vec<crate::WalSegmentDeletedEvent>, CompactorError> {
+        let catalog = CatalogState::load(&self.storage).await.map_err(|source| {
+            CompactorError::LoadCatalog {
+                source: Box::new(source),
+            }
+        })?;
+        let cleanup_candidates = catalog
+            .wal_segments
+            .values()
+            .filter(|segment| segment.state == FoldedWalSegmentState::Compacted)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut deleted_events = Vec::with_capacity(cleanup_candidates.len());
+        for segment in cleanup_candidates {
+            let path = ObjectPath::from(segment.path.clone());
+            self.storage.delete(&path).await.map_err(|source| {
+                CompactorError::DeleteWalSegment {
+                    segment_id: segment.segment_id.clone(),
+                    path: path.clone(),
+                    source: Box::new(source),
+                }
+            })?;
+
+            let event = crate::WalSegmentDeletedEvent::new(segment.segment_id, path, Utc::now());
+            CatalogEvent::WalSegmentDeleted(event.clone())
+                .save(&self.storage)
+                .await
+                .map_err(|source| CompactorError::SaveCatalogEvent {
+                    source: Box::new(source),
+                })?;
+            deleted_events.push(event);
+        }
+
+        Ok(deleted_events)
+    }
+
     async fn load_segment(
         &self,
         segment: FoldedWalSegment,
@@ -376,6 +415,13 @@ pub enum CompactorError {
         #[source]
         source: Box<ArrowError>,
     },
+    #[error("failed to delete compacted WAL segment '{segment_id}' at '{path}': {source}")]
+    DeleteWalSegment {
+        segment_id: crate::WalSegmentId,
+        path: ObjectPath,
+        #[source]
+        source: Box<StorageError>,
+    },
     #[error(
         "WAL segment '{path}' does not match schema fingerprint boundary '{schema_fingerprint}'"
     )]
@@ -444,7 +490,7 @@ mod tests {
 
     use crate::{
         AmberConfig, CatalogEvent, RecordBatchMetadata, SessionId, SessionManifest, Storage,
-        WalWriteRequest, WalWriter, prepend_metadata_columns,
+        WalSegmentClosedEvent, WalWriteRequest, WalWriter, paths, prepend_metadata_columns,
     };
 
     use super::*;
@@ -597,6 +643,257 @@ mod tests {
             .expect("compaction should succeed when nothing is pending");
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_compacted_deletes_only_compacted_segments_and_records_events() {
+        let storage_dir = TempDir::new().expect("storage dir should be created");
+        let staging_dir = TempDir::new().expect("staging dir should be created");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        SessionManifest::create(
+            &storage,
+            session_a.clone(),
+            Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session A manifest should be created");
+        SessionManifest::create(
+            &storage,
+            session_b.clone(),
+            Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session B manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_a.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch(vec![1], vec![Some("a")], vec![100], vec![110]),
+            ))
+            .await
+            .expect("first write should succeed");
+        writer
+            .rotate(crate::WalRotateRequest::new(
+                session_a.clone(),
+                "camera",
+                "image",
+            ))
+            .await
+            .expect("rotation should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_b.clone(),
+                "joint_states",
+                "state",
+                "schema-v2",
+                metadata_enriched_batch(vec![2], vec![Some("b")], vec![200], vec![210]),
+            ))
+            .await
+            .expect("second write should succeed");
+
+        let compactor = Compactor::new(storage.clone(), 0);
+        let committed = compactor
+            .compact_pending()
+            .await
+            .expect("compaction should succeed")
+            .expect("one compaction event should be written");
+        let post_compaction_state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load");
+        let compacted_segment_paths = committed
+            .source_wal_segments
+            .iter()
+            .map(|segment_id| {
+                post_compaction_state
+                    .wal_segments
+                    .get(segment_id)
+                    .expect("compacted segment should remain in catalog")
+                    .path
+                    .clone()
+            })
+            .collect::<HashSet<_>>();
+        writer.shutdown().await.expect("shutdown should succeed");
+        let post_shutdown_state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load after shutdown");
+        let pending_segment_path = post_shutdown_state
+            .wal_segments
+            .values()
+            .find(|segment| {
+                segment.state == FoldedWalSegmentState::Pending
+                    && segment.node_id == "joint_states"
+                    && segment.output_id == "state"
+                    && segment.schema_fingerprint == "schema-v2"
+                    && !compacted_segment_paths.contains(&segment.path)
+            })
+            .expect("one segment should remain pending")
+            .path
+            .clone();
+        let deleted = compactor
+            .cleanup_compacted()
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(deleted.len(), committed.source_wal_segments.len());
+        assert_eq!(
+            compactor
+                .cleanup_compacted()
+                .await
+                .expect("second cleanup should be idempotent")
+                .len(),
+            0
+        );
+
+        for event in &deleted {
+            let path = ObjectPath::from(event.path.clone());
+            assert!(
+                !storage
+                    .exists(&path)
+                    .await
+                    .expect("wal existence check should work"),
+                "compacted WAL should be removed from storage"
+            );
+        }
+
+        let pending_path = ObjectPath::from(pending_segment_path);
+        assert!(
+            storage
+                .exists(&pending_path)
+                .await
+                .expect("pending WAL existence check should work"),
+            "pending WAL should remain in storage"
+        );
+
+        let state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load");
+        assert_eq!(
+            state
+                .wal_segments
+                .values()
+                .filter(|segment| segment.state == FoldedWalSegmentState::Deleted)
+                .count(),
+            deleted.len()
+        );
+        assert_eq!(
+            state
+                .wal_segments
+                .values()
+                .filter(|segment| segment.state == FoldedWalSegmentState::Pending)
+                .count(),
+            1
+        );
+
+        SessionManifest::load(&storage, &session_a)
+            .await
+            .expect("session A manifest should remain readable");
+        SessionManifest::load(&storage, &session_b)
+            .await
+            .expect("session B manifest should remain readable");
+    }
+
+    #[tokio::test]
+    async fn cleanup_compacted_does_not_publish_delete_event_when_physical_delete_fails() {
+        let storage_dir = TempDir::new().expect("storage dir should be created");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+        let session_id = SessionId::new();
+        let segment_id = crate::WalSegmentId::new();
+        let wal_path = paths::wal_segment(
+            session_id.as_str(),
+            "camera",
+            "image",
+            &format!("segment-{segment_id}.arrow"),
+        );
+
+        CatalogEvent::WalSegmentClosed(WalSegmentClosedEvent {
+            event_id: crate::CatalogEventId::new(),
+            segment_id: segment_id.clone(),
+            session_id: session_id.clone(),
+            node_id: "camera".to_owned(),
+            output_id: "image".to_owned(),
+            schema_fingerprint: "schema-v1".to_owned(),
+            path: wal_path.to_string(),
+            row_count: 1,
+            byte_size: 1,
+            min_node_timestamp: 1,
+            max_node_timestamp: 1,
+            min_amber_timestamp: 2,
+            max_amber_timestamp: 2,
+            opened_at: Utc::now(),
+            closed_at: Utc::now(),
+        })
+        .save(&storage)
+        .await
+        .expect("closed event should save");
+        CatalogEvent::CompactionCommitted(CompactionCommittedEvent::new(
+            crate::CompactionId::new(),
+            vec![segment_id.clone()],
+            Vec::new(),
+            Utc::now(),
+        ))
+        .save(&storage)
+        .await
+        .expect("compaction event should save");
+
+        let compactor = Compactor::new(storage.clone(), 1);
+        let error = compactor
+            .cleanup_compacted()
+            .await
+            .expect_err("cleanup should fail when the WAL object is missing");
+        assert!(matches!(error, CompactorError::DeleteWalSegment { .. }));
+
+        let events = CatalogEvent::list(&storage)
+            .await
+            .expect("catalog events should list");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, CatalogEvent::WalSegmentDeleted(_)))
+                .count(),
+            0
+        );
+
+        let state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load");
+        assert_eq!(
+            state
+                .wal_segments
+                .get(&segment_id)
+                .expect("segment should exist")
+                .state,
+            FoldedWalSegmentState::Compacted
+        );
+
+        storage
+            .put_bytes(&wal_path, vec![1, 2, 3])
+            .await
+            .expect("WAL object should be restorable for retry");
+        let deleted = compactor
+            .cleanup_compacted()
+            .await
+            .expect("cleanup retry should succeed");
+        assert_eq!(deleted.len(), 1);
+        let state = CatalogState::load(&storage)
+            .await
+            .expect("state should load");
+        assert_eq!(
+            state
+                .wal_segments
+                .get(&segment_id)
+                .expect("segment should exist")
+                .state,
+            FoldedWalSegmentState::Deleted
+        );
     }
 
     fn metadata_enriched_batch(
