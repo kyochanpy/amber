@@ -24,7 +24,7 @@ struct CompactArgs {
     cleanup: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct CompactSummary {
     created_parquet_files: usize,
     compacted_segments: usize,
@@ -42,7 +42,12 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Compact(args) => {
             let summary = run_compact(&args).await?;
 
-            if summary.compacted_segments == 0 {
+            if summary.compacted_segments == 0 && summary.deleted_segments > 0 {
+                println!(
+                    "No new WAL segments required compaction. Deleted {} previously compacted WAL segment(s).",
+                    summary.deleted_segments
+                );
+            } else if summary.compacted_segments == 0 {
                 println!("No eligible closed WAL segments found for compaction.");
             } else {
                 println!(
@@ -51,7 +56,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
 
-            if args.cleanup {
+            if args.cleanup && summary.compacted_segments > 0 {
                 if summary.deleted_segments == 0 {
                     println!("No compacted WAL segments required cleanup.");
                 } else {
