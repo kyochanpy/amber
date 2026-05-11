@@ -84,6 +84,45 @@ impl Compactor {
         Ok(Some(event))
     }
 
+    pub async fn cleanup_compacted(
+        &self,
+    ) -> Result<Vec<crate::WalSegmentDeletedEvent>, CompactorError> {
+        let catalog = CatalogState::load(&self.storage).await.map_err(|source| {
+            CompactorError::LoadCatalog {
+                source: Box::new(source),
+            }
+        })?;
+        let cleanup_candidates = catalog
+            .wal_segments
+            .values()
+            .filter(|segment| segment.state == FoldedWalSegmentState::Compacted)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut deleted_events = Vec::with_capacity(cleanup_candidates.len());
+        for segment in cleanup_candidates {
+            let path = ObjectPath::from(segment.path.clone());
+            self.storage.delete(&path).await.map_err(|source| {
+                CompactorError::DeleteWalSegment {
+                    segment_id: segment.segment_id.clone(),
+                    path: path.clone(),
+                    source: Box::new(source),
+                }
+            })?;
+
+            let event = crate::WalSegmentDeletedEvent::new(segment.segment_id, path, Utc::now());
+            CatalogEvent::WalSegmentDeleted(event.clone())
+                .save(&self.storage)
+                .await
+                .map_err(|source| CompactorError::SaveCatalogEvent {
+                    source: Box::new(source),
+                })?;
+            deleted_events.push(event);
+        }
+
+        Ok(deleted_events)
+    }
+
     async fn load_segment(
         &self,
         segment: FoldedWalSegment,
@@ -375,6 +414,13 @@ pub enum CompactorError {
         path: ObjectPath,
         #[source]
         source: Box<ArrowError>,
+    },
+    #[error("failed to delete compacted WAL segment '{segment_id}' at '{path}': {source}")]
+    DeleteWalSegment {
+        segment_id: crate::WalSegmentId,
+        path: ObjectPath,
+        #[source]
+        source: Box<StorageError>,
     },
     #[error(
         "WAL segment '{path}' does not match schema fingerprint boundary '{schema_fingerprint}'"
