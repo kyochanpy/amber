@@ -78,7 +78,7 @@ impl SessionSourceSet {
                 source: Box::new(source),
             }
         })?;
-        let catalog = CatalogState::from_events(events.clone()).map_err(|source| {
+        let catalog = CatalogState::from_events(events.iter().cloned()).map_err(|source| {
             SessionSourceError::FoldCatalog {
                 session_id: session_id.clone(),
                 source: Box::new(source),
@@ -112,7 +112,7 @@ impl SessionSourceSet {
                 });
         }
 
-        let mut seen_parquet_sources = BTreeSet::<(SourceGroupKey, String)>::new();
+        let mut seen_parquet_sources = BTreeSet::<String>::new();
         for event in events {
             let CatalogEvent::CompactionCommitted(event) = event else {
                 continue;
@@ -135,7 +135,7 @@ impl SessionSourceSet {
                         })
                     });
                 if !has_requested_session_source
-                    || !seen_parquet_sources.insert((key.clone(), parquet_file.path.clone()))
+                    || !seen_parquet_sources.insert(parquet_file.path.clone())
                 {
                     continue;
                 }
