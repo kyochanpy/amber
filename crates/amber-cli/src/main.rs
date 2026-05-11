@@ -1,11 +1,27 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+};
 
 use amber_core::{
-    AmberConfig, CatalogState, Compactor, FoldedWalSegmentState, ObjectPath, SessionManifest,
-    SessionStatus, Storage, StorageBackend,
+    AMBER_TIMESTAMP_COLUMN, AmberConfig, CatalogState, Compactor, FoldedWalSegmentState,
+    NODE_TIMESTAMP_COLUMN, ObjectPath, SESSION_ID_COLUMN, SessionId, SessionManifest,
+    SessionSourceFilter, SessionSourceGroup, SessionSourceSet, SessionStatus, Storage,
+    StorageBackend, is_metadata_column,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use arrow::{
+    array::{Array, BooleanArray, RecordBatch, StringArray},
+    compute::filter_record_batch,
+    ipc::reader::StreamReader,
+    util::display::array_value_to_string,
+};
+use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rerun::{
+    RecordingStream, RecordingStreamBuilder, SpawnOptions, TextLog, default_flush_timeout,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "amber", version, about = "Amber command-line tools")]
@@ -17,6 +33,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Compact(CompactArgs),
+    Inspect(InspectArgs),
     List(ListArgs),
 }
 
@@ -42,6 +59,26 @@ struct ListArgs {
     tag: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct InspectArgs {
+    #[arg(value_name = "SESSION_SELECTOR")]
+    selector: Option<String>,
+    #[arg(long, default_value = "amber.yaml")]
+    config: PathBuf,
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long, conflicts_with = "selector")]
+    session: Option<String>,
+    #[arg(long)]
+    node: Option<String>,
+    #[arg(long)]
+    output: Option<String>,
+    #[arg(long)]
+    rerun: bool,
+    #[arg(long)]
+    blueprint: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 struct CompactSummary {
     created_parquet_files: usize,
@@ -54,6 +91,13 @@ struct SessionListEntry {
     manifest: SessionManifest,
     has_pending_wal: bool,
     has_committed_parquet: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InspectSelection {
+    session_id: SessionId,
+    node_id: Option<String>,
+    output_id: Option<String>,
 }
 
 #[tokio::main]
@@ -91,6 +135,9 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
+        }
+        Command::Inspect(args) => {
+            run_inspect(&args).await?;
         }
         Command::List(args) => {
             let sessions = run_list(&args).await?;
@@ -163,6 +210,298 @@ fn load_storage(config_path: &Path, data_dir: Option<&Path>) -> Result<Storage> 
             config_path.display()
         )
     })
+}
+
+async fn run_inspect(args: &InspectArgs) -> Result<()> {
+    if !args.rerun {
+        bail!("inspect currently requires --rerun for MVP output");
+    }
+    if args.output.is_some() && args.node.is_none() {
+        bail!("--output requires --node");
+    }
+
+    let storage = load_storage(&args.config, args.data_dir.as_deref())?;
+    let selection = resolve_inspect_selection(args, &storage).await?;
+    let source_set = SessionSourceSet::resolve(
+        &storage,
+        &selection.session_id,
+        SessionSourceFilter {
+            node_id: selection.node_id.clone(),
+            output_id: selection.output_id.clone(),
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to resolve inspect sources for session '{}'",
+            selection.session_id
+        )
+    })?;
+
+    if let Some(node_id) = &selection.node_id {
+        validate_selected_output(&source_set, node_id, selection.output_id.as_deref())?;
+    }
+
+    if source_set.groups.is_empty() {
+        bail!(
+            "session '{}' has no inspectable sources for the requested selection",
+            selection.session_id
+        );
+    }
+
+    let recording = build_rerun_recording(&selection, args.blueprint.as_deref())?;
+    for group in &source_set.groups {
+        inspect_group_to_rerun(&storage, &recording, &selection.session_id, group).await?;
+    }
+    recording.flush_blocking();
+
+    Ok(())
+}
+
+async fn resolve_inspect_selection(
+    args: &InspectArgs,
+    storage: &Storage,
+) -> Result<InspectSelection> {
+    let session_selector = args
+        .session
+        .as_deref()
+        .or(args.selector.as_deref())
+        .unwrap_or("latest");
+    let session_id = if session_selector == "latest" {
+        latest_session_id(storage).await?
+    } else {
+        SessionId::parse(session_selector)
+            .with_context(|| format!("invalid inspect session selector '{session_selector}'"))?
+    };
+
+    Ok(InspectSelection {
+        session_id,
+        node_id: args.node.clone(),
+        output_id: args.output.clone(),
+    })
+}
+
+async fn latest_session_id(storage: &Storage) -> Result<SessionId> {
+    let mut manifests = list_session_manifests(storage).await?;
+    manifests.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+    manifests
+        .into_iter()
+        .next()
+        .map(|manifest| manifest.session_id)
+        .ok_or_else(|| anyhow!("cannot inspect latest session because no sessions were found"))
+}
+
+fn validate_selected_output(
+    source_set: &SessionSourceSet,
+    node_id: &str,
+    output_id: Option<&str>,
+) -> Result<()> {
+    let matching_outputs = source_set
+        .groups
+        .iter()
+        .filter(|group| group.node_id == node_id)
+        .map(|group| group.output_id.as_str())
+        .collect::<Vec<_>>();
+
+    if matching_outputs.is_empty() {
+        bail!(
+            "session '{}' does not contain node '{}'",
+            source_set.session_id,
+            node_id
+        );
+    }
+
+    match output_id {
+        Some(output_id)
+            if matching_outputs
+                .iter()
+                .all(|candidate| *candidate != output_id) =>
+        {
+            bail!(
+                "session '{}' node '{}' does not contain output '{}'",
+                source_set.session_id,
+                node_id,
+                output_id
+            );
+        }
+        Some(_) => {}
+        None if matching_outputs.len() > 1 => {
+            bail!(
+                "node '{}' has multiple outputs in session '{}'; pass --output (available: {})",
+                node_id,
+                source_set.session_id,
+                matching_outputs.join(", ")
+            );
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
+fn build_rerun_recording(
+    selection: &InspectSelection,
+    blueprint: Option<&Path>,
+) -> Result<RecordingStream> {
+    let mut spawn_options = SpawnOptions::default();
+    if let Some(path) = blueprint {
+        let _ = std::fs::metadata(path)
+            .with_context(|| format!("failed to access blueprint file '{}'", path.display()))?;
+        spawn_options
+            .extra_args
+            .extend(["--blueprint".to_owned(), path.display().to_string()]);
+    }
+
+    RecordingStreamBuilder::new("amber.inspect")
+        .recording_id(format!("amber-inspect-{}", selection.session_id))
+        .spawn_opts(&spawn_options, default_flush_timeout())
+        .context(
+            "failed to spawn or connect to rerun; ensure the 'rerun' binary is installed and available on PATH",
+        )
+}
+
+async fn inspect_group_to_rerun(
+    storage: &Storage,
+    recording: &RecordingStream,
+    session_id: &SessionId,
+    group: &SessionSourceGroup,
+) -> Result<()> {
+    let mut amber_row_index = 0_i64;
+
+    for source in &group.parquet_sources {
+        let bytes = storage
+            .get_bytes(&source.path)
+            .await
+            .with_context(|| format!("failed to read parquet source '{}'", source.path))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
+            .with_context(|| format!("failed to open parquet source '{}'", source.path))?;
+        let reader = builder
+            .build()
+            .with_context(|| format!("failed to build parquet reader for '{}'", source.path))?;
+
+        for batch in reader {
+            let batch = batch.with_context(|| {
+                format!(
+                    "failed to decode parquet record batch from '{}'",
+                    source.path
+                )
+            })?;
+            let filtered = filter_batch_to_session(&batch, session_id).with_context(|| {
+                format!(
+                    "failed to apply session filter '{}' while reading parquet source '{}'",
+                    session_id, source.path
+                )
+            })?;
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+            log_batch_to_rerun(recording, group, &filtered, &mut amber_row_index)?;
+        }
+    }
+
+    for source in &group.wal_sources {
+        let bytes = storage
+            .get_bytes(&source.path)
+            .await
+            .with_context(|| format!("failed to read WAL source '{}'", source.path))?;
+        let reader = StreamReader::try_new(Cursor::new(bytes), None)
+            .with_context(|| format!("failed to open WAL stream '{}'", source.path))?;
+
+        for batch in reader {
+            let batch = batch.with_context(|| {
+                format!(
+                    "failed to decode Arrow IPC record batch from '{}'",
+                    source.path
+                )
+            })?;
+            log_batch_to_rerun(recording, group, &batch, &mut amber_row_index)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn filter_batch_to_session(batch: &RecordBatch, session_id: &SessionId) -> Result<RecordBatch> {
+    let session_column = batch
+        .column_by_name(SESSION_ID_COLUMN)
+        .ok_or_else(|| anyhow!("missing '{}' column", SESSION_ID_COLUMN))?;
+    let session_column = session_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("'{}' column must be Utf8", SESSION_ID_COLUMN))?;
+    let mask = BooleanArray::from(
+        (0..batch.num_rows())
+            .map(|row| Some(session_column.value(row) == session_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    filter_record_batch(batch, &mask).context("failed to filter record batch")
+}
+
+fn log_batch_to_rerun(
+    recording: &RecordingStream,
+    group: &SessionSourceGroup,
+    batch: &RecordBatch,
+    amber_row_index: &mut i64,
+) -> Result<()> {
+    let entity_path = format!("{}/{}", group.node_id, group.output_id);
+    let node_timestamps = typed_column::<arrow::array::Int64Array>(batch, NODE_TIMESTAMP_COLUMN)?;
+    let amber_timestamps = typed_column::<arrow::array::Int64Array>(batch, AMBER_TIMESTAMP_COLUMN)?;
+
+    for row_index in 0..batch.num_rows() {
+        recording.set_time_sequence("amber_row", *amber_row_index);
+        recording.set_time_nanos("node_time", node_timestamps.value(row_index));
+        recording.set_time_nanos("amber_time", amber_timestamps.value(row_index));
+        let archetype = TextLog::new(render_row_text(batch, row_index)?);
+
+        recording
+            .log(entity_path.as_str(), &archetype)
+            .with_context(|| {
+                format!("failed to log row {row_index} to rerun entity '{entity_path}'")
+            })?;
+        *amber_row_index += 1;
+    }
+
+    Ok(())
+}
+
+fn render_row_text(batch: &RecordBatch, row_index: usize) -> Result<String> {
+    let mut fields = Vec::new();
+    for field in batch.schema().fields() {
+        if is_metadata_column(field.name()) {
+            continue;
+        }
+        let column = batch
+            .column_by_name(field.name())
+            .ok_or_else(|| anyhow!("record batch is missing expected column '{}'", field.name()))?;
+        let value = array_value_to_string(column.as_ref(), row_index).with_context(|| {
+            format!(
+                "failed to render column '{}' at row {} as text",
+                field.name(),
+                row_index
+            )
+        })?;
+        fields.push(format!("{}={}", field.name(), value));
+    }
+
+    if fields.is_empty() {
+        Ok("<empty payload>".to_owned())
+    } else {
+        Ok(fields.join(", "))
+    }
+}
+
+fn typed_column<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| anyhow!("missing '{name}' column"))?
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| anyhow!("column '{name}' had an unexpected Arrow type"))
 }
 
 async fn run_list(args: &ListArgs) -> Result<Vec<SessionListEntry>> {
@@ -747,6 +1086,215 @@ mod tests {
         assert_eq!(entries[0].manifest.session_id, created.manifest.session_id);
     }
 
+    #[tokio::test]
+    async fn inspect_rejects_output_without_node() {
+        let storage_dir = TempDir::new().expect("storage dir should exist");
+        let config_path = write_config(storage_dir.path()).expect("config should be written");
+
+        let error = run_inspect(&InspectArgs {
+            selector: None,
+            config: config_path,
+            data_dir: None,
+            session: None,
+            node: None,
+            output: Some("image".to_owned()),
+            rerun: true,
+            blueprint: None,
+        })
+        .await
+        .expect_err("inspect should reject output without node");
+
+        assert!(error.to_string().contains("--output requires --node"));
+    }
+
+    #[tokio::test]
+    async fn inspect_latest_requires_output_when_node_has_multiple_outputs() {
+        let storage_dir = TempDir::new().expect("storage dir should exist");
+        let staging_dir = TempDir::new().expect("staging dir should exist");
+        let config_path = write_config(storage_dir.path()).expect("config should be written");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+
+        let session_id = SessionId::new();
+        SessionManifest::create(
+            &storage,
+            session_id.clone(),
+            chrono::Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "left",
+                "schema-left",
+                metadata_enriched_batch(vec![1], vec![Some("a")], vec![100], vec![110]),
+            ))
+            .await
+            .expect("left stream write should succeed");
+        writer
+            .rotate(amber_core::WalRotateRequest::new(
+                session_id.clone(),
+                "camera",
+                "left",
+            ))
+            .await
+            .expect("left rotation should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_id,
+                "camera",
+                "right",
+                "schema-right",
+                metadata_enriched_batch(vec![2], vec![Some("b")], vec![200], vec![210]),
+            ))
+            .await
+            .expect("right stream write should succeed");
+        writer.shutdown().await.expect("shutdown should succeed");
+
+        let error = run_inspect(&InspectArgs {
+            selector: Some("latest".to_owned()),
+            config: config_path,
+            data_dir: None,
+            session: None,
+            node: Some("camera".to_owned()),
+            output: None,
+            rerun: true,
+            blueprint: None,
+        })
+        .await
+        .expect_err("inspect should require --output");
+
+        assert!(error.to_string().contains("pass --output"));
+        assert!(error.to_string().contains("left"));
+        assert!(error.to_string().contains("right"));
+    }
+
+    #[tokio::test]
+    async fn inspect_filters_parquet_rows_to_selected_session() {
+        let storage_dir = TempDir::new().expect("storage dir should exist");
+        let staging_dir = TempDir::new().expect("staging dir should exist");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        SessionManifest::create(
+            &storage,
+            session_a.clone(),
+            chrono::Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session A manifest should be created");
+        SessionManifest::create(
+            &storage,
+            session_b.clone(),
+            chrono::Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session B manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_a.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch_for_stream(
+                    session_a.as_str(),
+                    "camera",
+                    "image",
+                    vec![1],
+                    vec![Some("session-a")],
+                    vec![100],
+                    vec![110],
+                ),
+            ))
+            .await
+            .expect("session A write should succeed");
+        writer
+            .rotate(amber_core::WalRotateRequest::new(
+                session_a.clone(),
+                "camera",
+                "image",
+            ))
+            .await
+            .expect("session A rotation should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_b.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch_for_stream(
+                    session_b.as_str(),
+                    "camera",
+                    "image",
+                    vec![2],
+                    vec![Some("session-b")],
+                    vec![200],
+                    vec![210],
+                ),
+            ))
+            .await
+            .expect("session B write should succeed");
+        writer
+            .rotate(amber_core::WalRotateRequest::new(
+                session_b.clone(),
+                "camera",
+                "image",
+            ))
+            .await
+            .expect("session B rotation should succeed");
+        writer.shutdown().await.expect("shutdown should succeed");
+
+        let compactor = Compactor::new(storage.clone(), 1);
+        compactor
+            .compact_pending()
+            .await
+            .expect("compaction should succeed");
+
+        let source_set =
+            SessionSourceSet::resolve(&storage, &session_a, SessionSourceFilter::default())
+                .await
+                .expect("source set should resolve");
+        assert_eq!(source_set.groups.len(), 1);
+        assert_eq!(source_set.groups[0].parquet_sources.len(), 1);
+
+        let parquet_path = source_set.groups[0].parquet_sources[0].path.clone();
+        let bytes = storage
+            .get_bytes(&parquet_path)
+            .await
+            .expect("parquet bytes should be readable");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
+            .expect("parquet builder should open")
+            .build()
+            .expect("parquet reader should build");
+
+        let mut labels = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("parquet batch should decode");
+            let filtered =
+                filter_batch_to_session(&batch, &session_a).expect("session filter should succeed");
+            let label_column = filtered
+                .column_by_name("label")
+                .expect("label column should exist")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("label column should be Utf8");
+            for row in 0..filtered.num_rows() {
+                labels.push(label_column.value(row).to_owned());
+            }
+        }
+
+        assert_eq!(labels, vec!["session-a".to_owned()]);
+    }
+
     struct CreatedManifest {
         manifest: SessionManifest,
     }
@@ -811,6 +1359,26 @@ mod tests {
         node_timestamps: Vec<i64>,
         amber_timestamps: Vec<i64>,
     ) -> RecordBatch {
+        metadata_enriched_batch_for_stream(
+            "session-1",
+            "node-a",
+            "output-x",
+            values,
+            labels,
+            node_timestamps,
+            amber_timestamps,
+        )
+    }
+
+    fn metadata_enriched_batch_for_stream(
+        session_id: &str,
+        node_id: &str,
+        output_id: &str,
+        values: Vec<i32>,
+        labels: Vec<Option<&str>>,
+        node_timestamps: Vec<i64>,
+        amber_timestamps: Vec<i64>,
+    ) -> RecordBatch {
         let payload = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int32, false),
@@ -826,9 +1394,9 @@ mod tests {
         prepend_metadata_columns(
             &payload,
             &RecordBatchMetadata::new(
-                "session-1",
-                "node-a",
-                "output-x",
+                session_id,
+                node_id,
+                output_id,
                 node_timestamps,
                 amber_timestamps,
             ),
