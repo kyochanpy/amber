@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use amber_core::{
-    AmberConfig, CatalogEvent, CatalogState, Compactor, FoldedWalSegmentState, ObjectPath,
-    SessionManifest, SessionStatus, Storage, StorageBackend,
+    AmberConfig, CatalogState, Compactor, FoldedWalSegmentState, ObjectPath, SessionManifest,
+    SessionStatus, Storage, StorageBackend,
 };
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -216,10 +216,16 @@ async fn list_session_manifests(storage: &Storage) -> Result<Vec<SessionManifest
         }
 
         let path = meta.location.clone();
-        let manifest = storage
-            .get_json::<SessionManifest>(&path)
-            .await
-            .with_context(|| format!("failed to load session manifest '{}'", path))?;
+        let manifest = match storage.get_json::<SessionManifest>(&path).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to load session manifest '{}': {}",
+                    path, error
+                );
+                continue;
+            }
+        };
         manifests.push(manifest);
     }
 
@@ -235,34 +241,21 @@ struct SessionPhysicalState {
 async fn load_session_physical_states(
     storage: &Storage,
 ) -> Result<std::collections::BTreeMap<amber_core::SessionId, SessionPhysicalState>> {
-    let events = CatalogEvent::list(storage)
+    let catalog = CatalogState::load(storage)
         .await
-        .context("failed to load catalog events while listing sessions")?;
-    let catalog = CatalogState::from_events(events.iter().cloned())
         .context("failed to fold catalog events while listing sessions")?;
     let mut states =
         std::collections::BTreeMap::<amber_core::SessionId, SessionPhysicalState>::new();
 
     for segment in catalog.wal_segments.values() {
         let state = states.entry(segment.session_id.clone()).or_default();
-        if segment.state == FoldedWalSegmentState::Pending {
-            state.has_pending_wal = true;
-        }
-    }
-
-    for event in events {
-        let CatalogEvent::CompactionCommitted(event) = event else {
-            continue;
-        };
-
-        for segment_id in event.source_wal_segments {
-            let Some(segment) = catalog.wal_segments.get(&segment_id) else {
-                continue;
-            };
-            states
-                .entry(segment.session_id.clone())
-                .or_default()
-                .has_committed_parquet = true;
+        match segment.state {
+            FoldedWalSegmentState::Pending => {
+                state.has_pending_wal = true;
+            }
+            FoldedWalSegmentState::Compacted | FoldedWalSegmentState::Deleted => {
+                state.has_committed_parquet = true;
+            }
         }
     }
 
