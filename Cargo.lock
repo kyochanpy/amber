@@ -85,8 +85,11 @@ version = "0.1.0"
 dependencies = [
  "amber-core",
  "anyhow",
+ "arrow 53.4.1",
+ "chrono",
  "clap",
  "datafusion",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
