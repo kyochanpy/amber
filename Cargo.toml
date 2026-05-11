@@ -15,10 +15,10 @@ license = "Apache-2.0"
 anyhow = "1"
 arrow = { version = "53", features = ["ipc"] }
 bytes = "1"
-chrono = { version = "0.4", features = ["serde", "clock"] }
+chrono = { version = "=0.4.39", features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
 datafusion = "43"
-dora-node-api = "0.3"
+dora-node-api = "=0.3.13"
 image = "0.25"
 object_store = "0.11"
 parquet = { version = "53", features = ["arrow"] }

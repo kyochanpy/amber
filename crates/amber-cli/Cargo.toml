@@ -7,14 +7,17 @@ license.workspace = true
 [dependencies]
 amber-core = { path = "../amber-core" }
 anyhow.workspace = true
+arrow.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 datafusion.workspace = true
+parquet.workspace = true
+rerun = { version = "0.17.0", default-features = false, features = ["sdk"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-arrow.workspace = true
 chrono.workspace = true
 tempfile = "3"
