@@ -74,12 +74,9 @@ fn init_tracing() {
 struct NodeRuntime {
     config_path: PathBuf,
     config: AmberConfig,
-    #[allow(dead_code)]
     storage: Storage,
     session_manifest: SessionManifest,
-    #[allow(dead_code)]
     writer: Arc<WalWriter>,
-    #[allow(dead_code)]
     rotation_runtime: Option<WalRotationRuntime>,
     #[allow(dead_code)]
     staging_root: PathBuf,
@@ -423,6 +420,7 @@ fn dora_data_to_record_batch(data: ArrowData) -> Result<RecordBatch> {
         .context("failed to wrap Dora array into a single-column record batch")?
     };
 
+    // dora-node-api links a separate copy of arrow; cross the crate boundary via IPC.
     let mut encoded = Vec::new();
     {
         let mut writer = dora_arrow::ipc::writer::StreamWriter::try_new(
