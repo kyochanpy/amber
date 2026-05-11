@@ -383,7 +383,7 @@ fn validate_parquet_bytes(bytes: Vec<u8>, path: &ObjectPath) -> Result<u64, Comp
         .build()
         .map_err(|source| CompactorError::DecodeParquet {
             path: path.clone(),
-            source: Box::new(source.into()),
+            source: Box::new(source),
         })?;
     let mut row_count = 0u64;
     for batch in reader {

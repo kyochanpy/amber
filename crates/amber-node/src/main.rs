@@ -14,12 +14,14 @@ use tracing::warn;
 fn main() {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 struct ActiveWalStream {
     session_id: SessionId,
     node_id: String,
     output_id: String,
 }
 
+#[allow(dead_code)]
 impl ActiveWalStream {
     fn new(
         session_id: SessionId,
@@ -35,14 +37,15 @@ impl ActiveWalStream {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct WalRotationRuntime {
     active_streams: Arc<tokio::sync::Mutex<HashSet<ActiveWalStream>>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
+#[allow(dead_code)]
 impl WalRotationRuntime {
-    #[allow(dead_code)]
     fn start(config: &AmberConfig, writer: Arc<WalWriter>) -> Result<Option<Self>> {
         Self::from_rotation_config(&config.wal.rotation, writer)
     }
