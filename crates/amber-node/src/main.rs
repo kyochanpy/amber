@@ -311,8 +311,8 @@ mod tests {
     };
 
     use amber_core::{
-        CatalogState, RecordBatchMetadata, SESSION_ID_COLUMN, SessionManifest, Storage,
-        prepend_metadata_columns,
+        CatalogState, RecordBatchMetadata, SESSION_ID_COLUMN, SessionManifest, SessionStatus,
+        Storage, prepend_metadata_columns,
     };
     use arrow::{
         array::{Int32Array, StringArray},
@@ -323,6 +323,99 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn startup_initializes_storage_manifest_writer_and_rotation_runtime() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+"#,
+        );
+
+        let runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+
+        assert_eq!(runtime.config.storage.backend, StorageBackend::Local);
+        assert_eq!(runtime.session_manifest.status, SessionStatus::Open);
+        assert!(
+            runtime
+                .storage
+                .exists(&runtime.session_manifest.path())
+                .await
+                .expect("manifest lookup should succeed")
+        );
+        assert!(
+            runtime
+                .staging_root
+                .starts_with(temp_dir.path().join("amber_data")),
+            "staging root should live under the configured local storage root"
+        );
+        runtime
+            .writer
+            .flush()
+            .await
+            .expect("writer should accept startup flush");
+        assert!(runtime.rotation_runtime.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_reads_config_path_from_amber_config_env() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+"#,
+        );
+
+        // SAFETY: these tests serialize all AMBER_CONFIG mutations behind ENV_LOCK.
+        unsafe {
+            env::set_var(AMBER_CONFIG_ENV, &config_path);
+        }
+
+        let runtime = NodeRuntime::initialize_from_env()
+            .await
+            .expect("env-based startup should succeed");
+
+        assert_eq!(runtime.config_path, config_path);
+        assert!(runtime.rotation_runtime.is_none());
+
+        // SAFETY: these tests serialize all AMBER_CONFIG mutations behind ENV_LOCK.
+        unsafe {
+            env::remove_var(AMBER_CONFIG_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reports_missing_amber_config_env() {
+        let _guard = ENV_LOCK.lock().await;
+        // SAFETY: these tests serialize all AMBER_CONFIG mutations behind ENV_LOCK.
+        unsafe {
+            env::remove_var(AMBER_CONFIG_ENV);
+        }
+
+        let error = match NodeRuntime::initialize_from_env().await {
+            Ok(_) => panic!("startup should fail without AMBER_CONFIG"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(AMBER_CONFIG_ENV));
+    }
 
     #[tokio::test]
     async fn rotation_runtime_rejects_non_default_size_policy() {
@@ -479,5 +572,11 @@ mod tests {
 
         assert_eq!(batch.schema().field(0).name(), SESSION_ID_COLUMN);
         batch
+    }
+
+    fn write_config(root: &Path, contents: &str) -> PathBuf {
+        let path = root.join("amber.yaml");
+        fs::write(&path, contents).expect("config file should be written");
+        path
     }
 }
