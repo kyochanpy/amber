@@ -593,22 +593,25 @@ impl WalRotationRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
 
     use amber_core::{
-        CatalogState, RecordBatchMetadata, SESSION_ID_COLUMN, SessionManifest, SessionStatus,
-        Storage,
+        CatalogState, NODE_ID_COLUMN, OUTPUT_ID_COLUMN, RecordBatchMetadata, SESSION_ID_COLUMN,
+        SchemaCatalogEntry, SessionManifest, SessionStatus, Storage,
         prepend_metadata_columns,
     };
     use arrow::{
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema},
+        ipc::reader::StreamReader,
         record_batch::RecordBatch,
     };
     use chrono::Utc;
+    use dora_node_api::dora_core::config::{Input, NodeRunConfig, UserInputMapping};
     use tempfile::TempDir;
 
     use super::*;
@@ -704,6 +707,198 @@ amber:
         };
 
         assert!(error.to_string().contains(AMBER_CONFIG_ENV));
+    }
+
+    #[test]
+    fn build_selected_inputs_filters_unconfigured_streams() {
+        let config = AmberConfig {
+            nodes: vec![amber_core::NodeConfig {
+                id: "camera".to_owned(),
+                outputs: vec![amber_core::OutputConfig {
+                    id: "image".to_owned(),
+                    every_n_frames: None,
+                }],
+            }],
+            ..AmberConfig::default()
+        };
+        let node_config = NodeRunConfig {
+            inputs: BTreeMap::from([
+                (
+                    DataId::from("camera_image".to_owned()),
+                    Input {
+                        mapping: InputMapping::User(UserInputMapping {
+                            source: "camera".to_owned().into(),
+                            output: "image".to_owned().into(),
+                        }),
+                        queue_size: None,
+                    },
+                ),
+                (
+                    DataId::from("camera_depth".to_owned()),
+                    Input {
+                        mapping: InputMapping::User(UserInputMapping {
+                            source: "camera".to_owned().into(),
+                            output: "depth".to_owned().into(),
+                        }),
+                        queue_size: None,
+                    },
+                ),
+            ]),
+            outputs: BTreeSet::new(),
+        };
+
+        let selected = build_selected_inputs(&config, &node_config);
+
+        assert_eq!(
+            selected,
+            HashMap::from([(
+                "camera_image".to_owned(),
+                ConfiguredStream::new("camera", "image"),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_input_persists_schema_and_writes_metadata_enriched_wal() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+  nodes:
+    - id: camera
+      outputs:
+        - id: image
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.configure_inputs(&NodeRunConfig {
+            inputs: BTreeMap::from([(
+                DataId::from("camera_image".to_owned()),
+                Input {
+                    mapping: InputMapping::User(UserInputMapping {
+                        source: "camera".to_owned().into(),
+                        output: "image".to_owned().into(),
+                    }),
+                    queue_size: None,
+                },
+            )]),
+            outputs: BTreeSet::new(),
+        });
+
+        let receipt = runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                1_700_000_000_123_456_789,
+                structured_arrow_data(),
+            )
+            .await
+            .expect("input handling should succeed")
+            .expect("selected input should produce a WAL receipt");
+
+        let stream_schemas = runtime.stream_schemas.clone();
+        let schema_fingerprint = stream_schemas
+            .get(&StreamSchemaKey {
+                node_id: "camera".to_owned(),
+                output_id: "image".to_owned(),
+            })
+            .expect("stream schema fingerprint should be tracked")
+            .clone();
+        let schema_entry = SchemaCatalogEntry::load(&runtime.storage, &schema_fingerprint)
+            .await
+            .expect("schema catalog entry should load");
+        assert_eq!(schema_entry.schema_fingerprint, schema_fingerprint);
+
+        let writer = Arc::clone(&runtime.writer);
+        let storage = runtime.storage.clone();
+        drop(runtime);
+
+        let mut writer = match Arc::try_unwrap(writer) {
+            Ok(writer) => writer,
+            Err(_) => panic!("writer should be uniquely owned"),
+        };
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown should publish WAL segment");
+
+        let wal_bytes = storage
+            .get_bytes(&receipt.path)
+            .await
+            .expect("published WAL segment should be readable");
+        let mut reader = StreamReader::try_new(std::io::Cursor::new(wal_bytes), None)
+            .expect("WAL IPC reader should open");
+        let batch = reader
+            .next()
+            .expect("one WAL batch should exist")
+            .expect("WAL batch should decode");
+
+        assert_eq!(batch.schema().field(0).name(), SESSION_ID_COLUMN);
+        assert_eq!(batch.schema().field(1).name(), NODE_ID_COLUMN);
+        assert_eq!(batch.schema().field(2).name(), OUTPUT_ID_COLUMN);
+    }
+
+    #[tokio::test]
+    async fn handle_input_rejects_same_session_schema_changes() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+  nodes:
+    - id: camera
+      outputs:
+        - id: image
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_image".to_owned(),
+            ConfiguredStream::new("camera", "image"),
+        );
+
+        runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                1_700_000_000_123_456_789,
+                structured_arrow_data(),
+            )
+            .await
+            .expect("first input should succeed");
+
+        let error = runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                1_700_000_000_123_456_790,
+                primitive_arrow_data(),
+            )
+            .await
+            .expect_err("schema change should be rejected");
+
+        match error {
+            InputHandlingError::Fatal(error) => {
+                assert!(error.to_string().contains("schema fingerprint changed within session"));
+            }
+            InputHandlingError::Recoverable(error) => {
+                panic!("expected fatal schema change error, got recoverable: {error}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -868,5 +1063,33 @@ amber:
         let path = root.join("amber.yaml");
         fs::write(&path, contents).expect("config file should be written");
         path
+    }
+
+    fn structured_arrow_data() -> ArrowData {
+        let batch = dora_arrow::record_batch::RecordBatch::try_new(
+            Arc::new(dora_arrow::datatypes::Schema::new(vec![
+                dora_arrow::datatypes::Field::new(
+                    "value",
+                    dora_arrow::datatypes::DataType::Int32,
+                    false,
+                ),
+                dora_arrow::datatypes::Field::new(
+                    "label",
+                    dora_arrow::datatypes::DataType::Utf8,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(dora_arrow::array::Int32Array::from(vec![1, 2])),
+                Arc::new(dora_arrow::array::StringArray::from(vec![Some("front"), Some("rear")])),
+            ],
+        )
+        .expect("payload batch should build");
+
+        ArrowData(Arc::new(dora_arrow::array::StructArray::from(batch)))
+    }
+
+    fn primitive_arrow_data() -> ArrowData {
+        ArrowData(Arc::new(dora_arrow::array::Int32Array::from(vec![1, 2, 3])))
     }
 }
