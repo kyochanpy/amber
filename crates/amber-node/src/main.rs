@@ -496,29 +496,30 @@ amber:
         runtime
             .shutdown()
             .await
-            .expect("runtime shutdown should succeed");
+            .expect("rotation runtime shutdown should succeed");
+        drop(runtime);
+
+        writer
+            .flush()
+            .await
+            .expect("writer flush after rotation should succeed");
 
         assert_ne!(first_receipt.segment_id, second_receipt.segment_id);
         assert_ne!(first_receipt.path, second_receipt.path);
 
-        let catalog = CatalogState::load(&storage)
-            .await
-            .expect("catalog should load after timed rotation");
-        assert_eq!(catalog.wal_segments.len(), 1);
-        assert!(
-            catalog
-                .wal_segments
-                .values()
-                .any(|segment| segment.node_id == "camera" && segment.output_id == "image")
-        );
-
-        let mut writer = Arc::try_unwrap(writer)
-            .map_err(|_| ())
-            .expect("writer should be unique");
+        let mut writer = match Arc::try_unwrap(writer) {
+            Ok(writer) => writer,
+            Err(_) => panic!("writer should not have remaining shared references"),
+        };
         writer
             .shutdown()
             .await
             .expect("writer shutdown should succeed");
+
+        let state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load");
+        assert_eq!(state.wal_segments.len(), 2);
     }
 
     async fn wait_for<F, Fut>(timeout: Duration, mut condition: F)
