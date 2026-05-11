@@ -1,17 +1,27 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use amber_core::{
-    AmberConfig, SessionId, SessionManifest, Storage, StorageBackend, WalRotateRequest,
-    WalRotationConfig, WalWriteRequest, WalWriter,
+    AmberConfig, RecordBatchMetadata, SchemaCatalogEntry, SessionId, SessionManifest, Storage,
+    StorageBackend, WalRotateRequest, WalRotationConfig, WalWriteRequest, WalWriter,
+    normalized_payload_schema, prepend_metadata_columns, schema_fingerprint_for_payload,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use arrow::record_batch::RecordBatch;
 use chrono::Utc;
+use dora_node_api::{
+    ArrowData, DoraNode, Event,
+    arrow as dora_arrow,
+    dora_core::{
+        config::{DataId, InputMapping, NodeRunConfig},
+    },
+    futures::StreamExt,
+};
 use tokio::{
     sync::oneshot,
     task::JoinHandle,
@@ -34,17 +44,23 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let runtime = NodeRuntime::initialize_from_env().await?;
+    let (node, mut events) = DoraNode::init_from_env()
+        .map_err(|error| anyhow!("failed to initialize Dora node from environment: {error}"))?;
+    let mut runtime = NodeRuntime::initialize_from_env().await?;
+    runtime.configure_inputs(node.node_config());
 
     info!(
         session_id = %runtime.session_manifest.session_id,
         config_path = %runtime.config_path.display(),
         storage_backend = %runtime.config.storage.backend,
+        selected_inputs = runtime.selected_inputs.len(),
         "amber-node startup completed"
     );
 
-    // Issue 18 stops after startup wiring. Issue 20 is responsible for
-    // introducing an explicit shutdown path that flushes and closes the writer.
+    while let Some(event) = events.next().await {
+        runtime.handle_event(event).await?;
+    }
+
     Ok(())
 }
 
@@ -67,6 +83,8 @@ struct NodeRuntime {
     rotation_runtime: Option<WalRotationRuntime>,
     #[allow(dead_code)]
     staging_root: PathBuf,
+    selected_inputs: HashMap<String, ConfiguredStream>,
+    stream_schemas: HashMap<StreamSchemaKey, String>,
 }
 
 impl NodeRuntime {
@@ -102,7 +120,136 @@ impl NodeRuntime {
             writer,
             rotation_runtime,
             staging_root,
+            selected_inputs: HashMap::new(),
+            stream_schemas: HashMap::new(),
         })
+    }
+
+    fn configure_inputs(&mut self, node_config: &NodeRunConfig) {
+        self.selected_inputs = build_selected_inputs(&self.config, node_config);
+    }
+
+    async fn handle_event(&mut self, event: Event) -> Result<()> {
+        match event {
+            Event::Input { id, metadata, data } => {
+                let node_timestamp = metadata_timestamp_nanos(&metadata)
+                    .context("failed to extract Dora input timestamp")?;
+                match self.handle_input(id, node_timestamp, data).await {
+                    Ok(Some(receipt)) => {
+                        info!(
+                            path = %receipt.path,
+                            row_count = receipt.row_count,
+                            "wrote input batch to WAL"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(InputHandlingError::Recoverable(error)) => {
+                        warn!(error = %error, "skipping recoverable input handling failure");
+                    }
+                    Err(InputHandlingError::Fatal(error)) => return Err(error),
+                }
+            }
+            Event::InputClosed { id } => {
+                info!(input_id = %id, "Dora input closed");
+            }
+            Event::Stop(cause) => {
+                info!(?cause, "received Dora stop event");
+            }
+            Event::Reload { operator_id } => {
+                info!(?operator_id, "received Dora reload event");
+            }
+            Event::Error(message) => {
+                warn!(error = %message, "received Dora event stream error");
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn handle_input(
+        &mut self,
+        input_id: DataId,
+        node_timestamp: i64,
+        data: ArrowData,
+    ) -> Result<Option<amber_core::WalWriteReceipt>, InputHandlingError> {
+        let input_id = input_id.to_string();
+        let Some(stream) = self.selected_inputs.get(&input_id).cloned() else {
+            return Ok(None);
+        };
+
+        let payload_batch = dora_data_to_record_batch(data).map_err(InputHandlingError::recoverable)?;
+        let schema_fingerprint =
+            schema_fingerprint_for_payload(payload_batch.schema().as_ref());
+
+        let stream_key = stream.schema_key();
+        if let Some(existing_schema_fingerprint) = self.stream_schemas.get(&stream_key)
+            && existing_schema_fingerprint != &schema_fingerprint
+        {
+            return Err(InputHandlingError::fatal(anyhow!(
+                "schema fingerprint changed within session for node '{}' output '{}': existing='{}', new='{}'",
+                stream.node_id,
+                stream.output_id,
+                existing_schema_fingerprint,
+                schema_fingerprint,
+            )));
+        }
+
+        SchemaCatalogEntry::new(
+            schema_fingerprint.clone(),
+            normalized_payload_schema(payload_batch.schema().as_ref()),
+        )
+        .save_if_absent(&self.storage)
+        .await
+        .map_err(|source| {
+            InputHandlingError::fatal(anyhow!(
+                "failed to persist schema catalog entry for node '{}' output '{}': {source}",
+                stream.node_id,
+                stream.output_id,
+            ))
+        })?;
+
+        let row_count = payload_batch.num_rows();
+        let amber_timestamp = current_time_nanos()
+            .context("failed to compute amber timestamp")
+            .map_err(InputHandlingError::fatal)?;
+        let enriched_batch = prepend_metadata_columns(
+            &payload_batch,
+            &RecordBatchMetadata::new(
+                self.session_manifest.session_id.as_str(),
+                &stream.node_id,
+                &stream.output_id,
+                vec![node_timestamp; row_count],
+                vec![amber_timestamp; row_count],
+            ),
+        )
+        .map_err(InputHandlingError::recoverable)?;
+
+        let request = WalWriteRequest::new(
+            self.session_manifest.session_id.clone(),
+            stream.node_id.clone(),
+            stream.output_id.clone(),
+            schema_fingerprint.clone(),
+            enriched_batch,
+        );
+
+        if let Some(rotation_runtime) = &self.rotation_runtime {
+            rotation_runtime.record_write(&request).await;
+        }
+
+        let receipt = self.writer.write(request).await.map_err(|source| {
+            InputHandlingError::fatal(anyhow!(
+                "failed to write WAL batch for node '{}' output '{}': {source}",
+                stream.node_id,
+                stream.output_id,
+            ))
+        })?;
+
+        self.stream_schemas
+            .entry(stream_key)
+            .or_insert(schema_fingerprint);
+
+        Ok(Some(receipt))
     }
 }
 
@@ -173,6 +320,147 @@ fn prepare_staging_root(
     })?;
 
     Ok(staging_root)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfiguredStream {
+    node_id: String,
+    output_id: String,
+}
+
+impl ConfiguredStream {
+    fn new(node_id: impl Into<String>, output_id: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            output_id: output_id.into(),
+        }
+    }
+
+    fn schema_key(&self) -> StreamSchemaKey {
+        StreamSchemaKey {
+            node_id: self.node_id.clone(),
+            output_id: self.output_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StreamSchemaKey {
+    node_id: String,
+    output_id: String,
+}
+
+#[derive(Debug)]
+enum InputHandlingError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl InputHandlingError {
+    fn recoverable(error: impl Into<anyhow::Error>) -> Self {
+        Self::Recoverable(error.into())
+    }
+
+    fn fatal(error: impl Into<anyhow::Error>) -> Self {
+        Self::Fatal(error.into())
+    }
+}
+
+fn build_selected_inputs(
+    config: &AmberConfig,
+    node_config: &NodeRunConfig,
+) -> HashMap<String, ConfiguredStream> {
+    let selected_outputs = config
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.clone(),
+                node.outputs
+                    .iter()
+                    .map(|output| output.id.clone())
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    node_config
+        .inputs
+        .iter()
+        .filter_map(|(input_id, input)| {
+            let InputMapping::User(mapping) = &input.mapping else {
+                return None;
+            };
+
+            let node_id = mapping.source.to_string();
+            let output_id = mapping.output.to_string();
+            let outputs = selected_outputs.get(&node_id)?;
+            outputs
+                .contains(&output_id)
+                .then(|| (input_id.to_string(), ConfiguredStream::new(node_id, output_id)))
+        })
+        .collect()
+}
+
+fn dora_data_to_record_batch(data: ArrowData) -> Result<RecordBatch> {
+    let array = data.0;
+
+    let dora_batch = if let Some(struct_array) = array.as_any().downcast_ref::<dora_arrow::array::StructArray>() {
+        if dora_arrow::array::Array::null_count(struct_array) > 0 {
+            bail!("nullable top-level struct arrays are not supported for ingest");
+        }
+        dora_arrow::record_batch::RecordBatch::from(struct_array)
+    } else {
+        let field = dora_arrow::datatypes::Field::new(
+            "value",
+            array.data_type().clone(),
+            array.null_count() > 0,
+        );
+        dora_arrow::record_batch::RecordBatch::try_new(
+            Arc::new(dora_arrow::datatypes::Schema::new(vec![field])),
+            vec![array],
+        )
+        .context("failed to wrap Dora array into a single-column record batch")?
+    };
+
+    let mut encoded = Vec::new();
+    {
+        let mut writer = dora_arrow::ipc::writer::StreamWriter::try_new(
+            &mut encoded,
+            &dora_batch.schema(),
+        )
+        .context("failed to create Dora Arrow IPC writer")?;
+        writer
+            .write(&dora_batch)
+            .context("failed to encode Dora payload batch to IPC")?;
+        writer
+            .finish()
+            .context("failed to finalize Dora payload IPC stream")?;
+    }
+
+    let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(encoded), None)
+        .context("failed to decode Dora IPC stream into amber Arrow batch")?;
+    reader
+        .next()
+        .transpose()
+        .context("failed to read converted payload batch")?
+        .ok_or_else(|| anyhow!("Dora IPC stream did not contain a payload batch"))
+}
+
+fn metadata_timestamp_nanos(metadata: &dora_node_api::Metadata) -> Result<i64> {
+    system_time_to_nanos(metadata.timestamp().get_time().to_system_time())
+        .context("failed to convert Dora metadata timestamp to unix nanoseconds")
+}
+
+fn current_time_nanos() -> Result<i64> {
+    system_time_to_nanos(SystemTime::now())
+}
+
+fn system_time_to_nanos(timestamp: SystemTime) -> Result<i64> {
+    let duration = timestamp
+        .duration_since(UNIX_EPOCH)
+        .context("timestamp predates unix epoch")?;
+    i64::try_from(duration.as_nanos()).context("timestamp exceeds i64 nanosecond range")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -312,7 +600,8 @@ mod tests {
 
     use amber_core::{
         CatalogState, RecordBatchMetadata, SESSION_ID_COLUMN, SessionManifest, SessionStatus,
-        Storage, prepend_metadata_columns,
+        Storage,
+        prepend_metadata_columns,
     };
     use arrow::{
         array::{Int32Array, StringArray},
