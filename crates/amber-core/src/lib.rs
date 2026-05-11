@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod compactor;
 pub mod config;
+pub mod read_set;
 pub mod schema;
 pub mod session;
 pub mod storage;
@@ -18,6 +19,10 @@ pub use compactor::{Compactor, CompactorError};
 pub use config::{
     AmberConfig, CompactionConfig, ConfigError, NodeConfig, OutputConfig, StorageBackend,
     StorageConfig, WalConfig, WalRotationConfig,
+};
+pub use read_set::{
+    ParquetSource, SessionSourceError, SessionSourceFilter, SessionSourceGroup, SessionSourceSet,
+    WalSource,
 };
 pub use schema::{
     AMBER_TIMESTAMP_COLUMN, METADATA_COLUMNS, MetadataColumnsError, NODE_ID_COLUMN,
