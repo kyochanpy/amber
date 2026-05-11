@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 amber-core = { path = "../amber-core" }
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 datafusion.workspace = true
 tokio.workspace = true
