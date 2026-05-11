@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 amber-core = { path = "../amber-core" }
 anyhow.workspace = true
+chrono.workspace = true
 dora-node-api.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -14,5 +15,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 arrow.workspace = true
-chrono.workspace = true
 tempfile = "3"

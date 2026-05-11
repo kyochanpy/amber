@@ -1,17 +1,179 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use amber_core::{
-    AmberConfig, SessionId, WalRotateRequest, WalRotationConfig, WalWriteRequest, WalWriter,
+    AmberConfig, SessionId, SessionManifest, Storage, StorageBackend, WalRotateRequest,
+    WalRotationConfig, WalWriteRequest, WalWriter,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use tokio::{
     sync::oneshot,
     task::JoinHandle,
     time::{MissedTickBehavior, interval},
 };
-use tracing::warn;
+use tracing::{Level, error, info, warn};
 
-fn main() {}
+const AMBER_CONFIG_ENV: &str = "AMBER_CONFIG";
+const STAGING_ROOT_DIR: &str = "_staging";
+
+#[tokio::main]
+async fn main() {
+    init_tracing();
+
+    if let Err(error) = run().await {
+        error!(error = %error, "amber-node startup failed");
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
+    let runtime = NodeRuntime::initialize_from_env().await?;
+
+    info!(
+        session_id = %runtime.session_manifest.session_id,
+        config_path = %runtime.config_path.display(),
+        storage_backend = %runtime.config.storage.backend,
+        "amber-node startup completed"
+    );
+
+    // Issue 18 stops after startup wiring. Issue 20 is responsible for
+    // introducing an explicit shutdown path that flushes and closes the writer.
+    Ok(())
+}
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .try_init();
+}
+
+struct NodeRuntime {
+    config_path: PathBuf,
+    config: AmberConfig,
+    #[allow(dead_code)]
+    storage: Storage,
+    session_manifest: SessionManifest,
+    #[allow(dead_code)]
+    writer: Arc<WalWriter>,
+    #[allow(dead_code)]
+    rotation_runtime: Option<WalRotationRuntime>,
+    #[allow(dead_code)]
+    staging_root: PathBuf,
+}
+
+impl NodeRuntime {
+    async fn initialize_from_env() -> Result<Self> {
+        let config_path = amber_config_path_from_env()?;
+        Self::initialize_from_path(config_path).await
+    }
+
+    async fn initialize_from_path(config_path: impl Into<PathBuf>) -> Result<Self> {
+        let config_path = config_path.into();
+        let config = load_config(&config_path)?;
+        let storage = initialize_storage(&config, &config_path)?;
+        let session_manifest = start_session(&storage, &config).await?;
+        let staging_root = prepare_staging_root(&config.storage, &session_manifest.session_id)
+            .with_context(|| {
+                format!(
+                    "failed to prepare WAL staging root for config '{}'",
+                    config_path.display()
+                )
+            })?;
+        let writer = Arc::new(WalWriter::spawn_local(
+            storage.clone(),
+            staging_root.clone(),
+        ));
+        let rotation_runtime = WalRotationRuntime::start(&config, Arc::clone(&writer))
+            .context("failed to initialize WAL rotation runtime")?;
+
+        Ok(Self {
+            config_path,
+            config,
+            storage,
+            session_manifest,
+            writer,
+            rotation_runtime,
+            staging_root,
+        })
+    }
+}
+
+fn amber_config_path_from_env() -> Result<PathBuf> {
+    env::var_os(AMBER_CONFIG_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("{AMBER_CONFIG_ENV} is not set"))
+}
+
+fn load_config(path: &Path) -> Result<AmberConfig> {
+    AmberConfig::from_file(path)
+        .with_context(|| format!("failed to load amber config from '{}'", path.display()))
+}
+
+fn initialize_storage(config: &AmberConfig, config_path: &Path) -> Result<Storage> {
+    if config.storage.backend == StorageBackend::Local {
+        let root = config.storage.resolved_local_path();
+        fs::create_dir_all(&root).with_context(|| {
+            format!(
+                "failed to create local storage root '{}' for '{}'",
+                root.display(),
+                config_path.display()
+            )
+        })?;
+    }
+
+    Storage::from_config(&config.storage).with_context(|| {
+        format!(
+            "failed to initialize storage backend '{}' from '{}'",
+            config.storage.backend,
+            config_path.display()
+        )
+    })
+}
+
+async fn start_session(storage: &Storage, config: &AmberConfig) -> Result<SessionManifest> {
+    let session_id = SessionId::new();
+    let started_at = Utc::now();
+
+    SessionManifest::create(storage, session_id, started_at, config.clone())
+        .await
+        .context("failed to create open session manifest")
+}
+
+fn prepare_staging_root(
+    storage: &amber_core::StorageConfig,
+    session_id: &SessionId,
+) -> Result<PathBuf> {
+    let staging_root = match storage.backend {
+        StorageBackend::Local => storage
+            .resolved_local_path()
+            .join(STAGING_ROOT_DIR)
+            .join(format!("session_id={session_id}")),
+        _ => {
+            bail!(
+                "storage backend '{}' is not yet supported by amber-node startup",
+                storage.backend
+            )
+        }
+    };
+
+    // Issue 20 is expected to own staging cleanup as part of graceful shutdown.
+    fs::create_dir_all(&staging_root).with_context(|| {
+        format!(
+            "failed to create WAL staging directory '{}'",
+            staging_root.display()
+        )
+    })?;
+
+    Ok(staging_root)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
@@ -143,11 +305,14 @@ impl WalRotationRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use amber_core::{
-        CatalogState, RecordBatchMetadata, SESSION_ID_COLUMN, SessionManifest, Storage,
-        prepend_metadata_columns,
+        CatalogState, RecordBatchMetadata, SESSION_ID_COLUMN, SessionManifest, SessionStatus,
+        Storage, prepend_metadata_columns,
     };
     use arrow::{
         array::{Int32Array, StringArray},
@@ -158,6 +323,99 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn startup_initializes_storage_manifest_writer_and_rotation_runtime() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+"#,
+        );
+
+        let runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+
+        assert_eq!(runtime.config.storage.backend, StorageBackend::Local);
+        assert_eq!(runtime.session_manifest.status, SessionStatus::Open);
+        assert!(
+            runtime
+                .storage
+                .exists(&runtime.session_manifest.path())
+                .await
+                .expect("manifest lookup should succeed")
+        );
+        assert!(
+            runtime
+                .staging_root
+                .starts_with(temp_dir.path().join("amber_data")),
+            "staging root should live under the configured local storage root"
+        );
+        runtime
+            .writer
+            .flush()
+            .await
+            .expect("writer should accept startup flush");
+        assert!(runtime.rotation_runtime.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_reads_config_path_from_amber_config_env() {
+        let _guard = ENV_LOCK.lock().await;
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+"#,
+        );
+
+        // SAFETY: these tests serialize all AMBER_CONFIG mutations behind ENV_LOCK.
+        unsafe {
+            env::set_var(AMBER_CONFIG_ENV, &config_path);
+        }
+
+        let runtime = NodeRuntime::initialize_from_env()
+            .await
+            .expect("env-based startup should succeed");
+
+        assert_eq!(runtime.config_path, config_path);
+        assert!(runtime.rotation_runtime.is_none());
+
+        // SAFETY: these tests serialize all AMBER_CONFIG mutations behind ENV_LOCK.
+        unsafe {
+            env::remove_var(AMBER_CONFIG_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reports_missing_amber_config_env() {
+        let _guard = ENV_LOCK.lock().await;
+        // SAFETY: these tests serialize all AMBER_CONFIG mutations behind ENV_LOCK.
+        unsafe {
+            env::remove_var(AMBER_CONFIG_ENV);
+        }
+
+        let error = match NodeRuntime::initialize_from_env().await {
+            Ok(_) => panic!("startup should fail without AMBER_CONFIG"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(AMBER_CONFIG_ENV));
+    }
 
     #[tokio::test]
     async fn rotation_runtime_rejects_non_default_size_policy() {
@@ -238,29 +496,30 @@ mod tests {
         runtime
             .shutdown()
             .await
-            .expect("runtime shutdown should succeed");
+            .expect("rotation runtime shutdown should succeed");
+        drop(runtime);
+
+        writer
+            .flush()
+            .await
+            .expect("writer flush after rotation should succeed");
 
         assert_ne!(first_receipt.segment_id, second_receipt.segment_id);
         assert_ne!(first_receipt.path, second_receipt.path);
 
-        let catalog = CatalogState::load(&storage)
-            .await
-            .expect("catalog should load after timed rotation");
-        assert_eq!(catalog.wal_segments.len(), 1);
-        assert!(
-            catalog
-                .wal_segments
-                .values()
-                .any(|segment| segment.node_id == "camera" && segment.output_id == "image")
-        );
-
-        let mut writer = Arc::try_unwrap(writer)
-            .map_err(|_| ())
-            .expect("writer should be unique");
+        let mut writer = match Arc::try_unwrap(writer) {
+            Ok(writer) => writer,
+            Err(_) => panic!("writer should not have remaining shared references"),
+        };
         writer
             .shutdown()
             .await
             .expect("writer shutdown should succeed");
+
+        let state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load");
+        assert_eq!(state.wal_segments.len(), 2);
     }
 
     async fn wait_for<F, Fut>(timeout: Duration, mut condition: F)
@@ -314,5 +573,11 @@ mod tests {
 
         assert_eq!(batch.schema().field(0).name(), SESSION_ID_COLUMN);
         batch
+    }
+
+    fn write_config(root: &Path, contents: &str) -> PathBuf {
+        let path = root.join("amber.yaml");
+        fs::write(&path, contents).expect("config file should be written");
+        path
     }
 }
