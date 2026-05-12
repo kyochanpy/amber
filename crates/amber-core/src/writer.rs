@@ -30,6 +30,11 @@ pub struct WalWriter {
     is_shutdown: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct WalWriterHandle {
+    command_tx: mpsc::Sender<CommandEnvelope>,
+}
+
 impl WalWriter {
     pub fn spawn_local(storage: Storage, staging_root: impl Into<PathBuf>) -> Self {
         Self::spawn_local_with_capacity(storage, staging_root, DEFAULT_WRITER_QUEUE_CAPACITY)
@@ -51,7 +56,7 @@ impl WalWriter {
     }
 
     pub async fn write(&self, request: WalWriteRequest) -> Result<WalWriteReceipt, WalWriterError> {
-        match self.send_command(WriteCommand::Write(request)).await? {
+        match send_command(&self.command_tx, WriteCommand::Write(request)).await? {
             CommandResult::Write(receipt) => Ok(receipt),
             _ => Err(WalWriterError::UnexpectedResponse {
                 expected: "write",
@@ -61,7 +66,7 @@ impl WalWriter {
     }
 
     pub async fn flush(&self) -> Result<(), WalWriterError> {
-        match self.send_command(WriteCommand::Flush).await? {
+        match send_command(&self.command_tx, WriteCommand::Flush).await? {
             CommandResult::Flushed => Ok(()),
             _ => Err(WalWriterError::UnexpectedResponse {
                 expected: "flush",
@@ -74,7 +79,7 @@ impl WalWriter {
         &self,
         request: WalRotateRequest,
     ) -> Result<WalRotateReceipt, WalWriterError> {
-        match self.send_command(WriteCommand::Rotate(request)).await? {
+        match send_command(&self.command_tx, WriteCommand::Rotate(request)).await? {
             CommandResult::Rotated(receipt) => Ok(receipt),
             _ => Err(WalWriterError::UnexpectedResponse {
                 expected: "rotate",
@@ -90,7 +95,7 @@ impl WalWriter {
 
         self.is_shutdown = true;
 
-        match self.send_command(WriteCommand::Shutdown).await {
+        match send_command(&self.command_tx, WriteCommand::Shutdown).await {
             Ok(CommandResult::Shutdown) => {}
             Ok(_) => {
                 return Err(WalWriterError::UnexpectedResponse {
@@ -108,19 +113,10 @@ impl WalWriter {
         self.await_join().await
     }
 
-    async fn send_command(&self, command: WriteCommand) -> Result<CommandResult, WalWriterError> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(CommandEnvelope {
-                command,
-                response_tx,
-            })
-            .await
-            .map_err(|_| WalWriterError::TaskUnavailable)?;
-
-        response_rx
-            .await
-            .map_err(|_| WalWriterError::TaskUnavailable)?
+    pub fn handle(&self) -> WalWriterHandle {
+        WalWriterHandle {
+            command_tx: self.command_tx.clone(),
+        }
     }
 
     async fn await_join(&mut self) -> Result<(), WalWriterError> {
@@ -130,6 +126,21 @@ impl WalWriter {
                 .map_err(|source| WalWriterError::JoinTask { source })?;
         }
         Ok(())
+    }
+}
+
+impl WalWriterHandle {
+    pub async fn rotate(
+        &self,
+        request: WalRotateRequest,
+    ) -> Result<WalRotateReceipt, WalWriterError> {
+        match send_command(&self.command_tx, WriteCommand::Rotate(request)).await? {
+            CommandResult::Rotated(receipt) => Ok(receipt),
+            _ => Err(WalWriterError::UnexpectedResponse {
+                expected: "rotate",
+                actual: "non-rotate",
+            }),
+        }
     }
 }
 
@@ -343,6 +354,24 @@ pub enum WalWriterError {
 struct CommandEnvelope {
     command: WriteCommand,
     response_tx: oneshot::Sender<Result<CommandResult, WalWriterError>>,
+}
+
+async fn send_command(
+    command_tx: &mpsc::Sender<CommandEnvelope>,
+    command: WriteCommand,
+) -> Result<CommandResult, WalWriterError> {
+    let (response_tx, response_rx) = oneshot::channel();
+    command_tx
+        .send(CommandEnvelope {
+            command,
+            response_tx,
+        })
+        .await
+        .map_err(|_| WalWriterError::TaskUnavailable)?;
+
+    response_rx
+        .await
+        .map_err(|_| WalWriterError::TaskUnavailable)?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
