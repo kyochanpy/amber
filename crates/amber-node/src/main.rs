@@ -58,8 +58,21 @@ async fn run() -> Result<()> {
         "amber-node startup completed"
     );
 
+    let mut stop_requested = false;
     while let Some(event) = events.next().await {
-        runtime.handle_event(event).await?;
+        if runtime.handle_event(event).await? == EventHandling::StopRequested {
+            stop_requested = true;
+            break;
+        }
+    }
+
+    if stop_requested {
+        runtime.shutdown().await?;
+    } else {
+        warn!(
+            session_id = %runtime.session_manifest.session_id,
+            "Dora event stream ended without a stop event; skipping normal session close"
+        );
     }
 
     Ok(())
@@ -124,7 +137,7 @@ impl NodeRuntime {
         self.selected_inputs = build_selected_inputs(&self.config, node_config);
     }
 
-    async fn handle_event(&mut self, event: Event) -> Result<()> {
+    async fn handle_event(&mut self, event: Event) -> Result<EventHandling> {
         match event {
             Event::Input { id, metadata, data } => {
                 let node_timestamp = metadata_timestamp_nanos(&metadata)
@@ -143,23 +156,26 @@ impl NodeRuntime {
                     }
                     Err(InputHandlingError::Fatal(error)) => return Err(error),
                 }
+                Ok(EventHandling::Continue)
             }
             Event::InputClosed { id } => {
                 info!(input_id = %id, "Dora input closed");
+                Ok(EventHandling::Continue)
             }
             Event::Stop(cause) => {
                 info!(?cause, "received Dora stop event");
+                Ok(EventHandling::StopRequested)
             }
             Event::Reload { operator_id } => {
                 info!(?operator_id, "received Dora reload event");
+                Ok(EventHandling::Continue)
             }
             Event::Error(message) => {
                 warn!(error = %message, "received Dora event stream error");
+                Ok(EventHandling::Continue)
             }
-            _ => {}
+            _ => Ok(EventHandling::Continue),
         }
-
-        Ok(())
     }
 
     async fn handle_input(
@@ -250,6 +266,74 @@ impl NodeRuntime {
 
         Ok(Some(receipt))
     }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        info!(
+            session_id = %self.session_manifest.session_id,
+            "starting graceful shutdown"
+        );
+
+        if let Some(rotation_runtime) = self.rotation_runtime.as_mut()
+            && let Err(error) = rotation_runtime.shutdown().await
+        {
+            error!(error = %error, "failed to stop WAL rotation runtime");
+            return Err(error);
+        }
+        self.rotation_runtime = None;
+
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(());
+        };
+
+        if let Err(error) = writer.flush().await {
+            error!(error = %error, "failed to flush WAL writer during shutdown");
+            return Err(error.into());
+        }
+
+        if let Err(error) = writer.shutdown().await {
+            error!(error = %error, "failed to shutdown WAL writer");
+            return Err(error.into());
+        }
+
+        let latest_manifest =
+            match SessionManifest::load(&self.storage, &self.session_manifest.session_id).await {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    error!(error = %error, "failed to reload session manifest before close");
+                    return Err(error.into());
+                }
+            };
+        self.session_manifest = latest_manifest;
+
+        if let Err(error) = self.session_manifest.close_and_save(&self.storage, Utc::now()).await {
+            error!(error = %error, "failed to close session manifest");
+            return Err(error.into());
+        }
+
+        match fs::remove_dir_all(&self.staging_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    path = %self.staging_root.display(),
+                    "failed to remove WAL staging directory"
+                );
+            }
+        }
+
+        info!(
+            session_id = %self.session_manifest.session_id,
+            "graceful shutdown completed"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventHandling {
+    Continue,
+    StopRequested,
 }
 
 fn amber_config_path_from_env() -> Result<PathBuf> {
@@ -895,6 +979,109 @@ amber:
                 panic!("expected fatal schema change error, got recoverable: {error}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn handle_stop_requests_event_loop_shutdown() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+
+        let outcome = runtime
+            .handle_event(Event::Stop(dora_node_api::StopCause::Manual))
+            .await
+            .expect("stop handling should succeed");
+
+        assert_eq!(outcome, EventHandling::StopRequested);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_session_and_cleans_up_staging_state() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+  nodes:
+    - id: camera
+      outputs:
+        - id: image
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.configure_inputs(&NodeRunConfig {
+            inputs: BTreeMap::from([(
+                DataId::from("camera_image".to_owned()),
+                Input {
+                    mapping: InputMapping::User(UserInputMapping {
+                        source: "camera".to_owned().into(),
+                        output: "image".to_owned().into(),
+                    }),
+                    queue_size: None,
+                },
+            )]),
+            outputs: BTreeSet::new(),
+        });
+
+        let receipt = runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                1_700_000_000_123_456_789,
+                structured_arrow_data(),
+            )
+            .await
+            .expect("input handling should succeed")
+            .expect("selected input should produce a WAL receipt");
+
+        let session_id = runtime.session_manifest.session_id.clone();
+        let staging_root = runtime.staging_root.clone();
+        let storage = runtime.storage.clone();
+
+        runtime
+            .shutdown()
+            .await
+            .expect("runtime shutdown should succeed");
+
+        let manifest = SessionManifest::load(&storage, &session_id)
+            .await
+            .expect("closed manifest should load");
+        assert_eq!(manifest.status, SessionStatus::Closed);
+        assert!(manifest.ended_at.is_some());
+        assert_eq!(manifest.observed_streams.len(), 1);
+        assert!(!staging_root.exists(), "staging root should be removed");
+
+        let state = CatalogState::load(&storage)
+            .await
+            .expect("catalog state should load");
+        assert_eq!(state.wal_segments.len(), 1);
+        assert!(
+            !storage
+                .get_bytes(&receipt.path)
+                .await
+                .expect("published WAL should be readable")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
