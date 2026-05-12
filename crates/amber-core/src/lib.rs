@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod compactor;
 pub mod config;
+pub mod image;
 pub mod read_set;
 pub mod schema;
 pub mod session;
@@ -20,6 +21,7 @@ pub use config::{
     AmberConfig, CompactionConfig, ConfigError, NodeConfig, OutputConfig, StorageBackend,
     StorageConfig, WalConfig, WalRotationConfig,
 };
+pub use image::{ImageError, PreparedImageBatch, prepare_compressed_image_batch};
 pub use read_set::{
     ParquetSource, SessionSourceError, SessionSourceFilter, SessionSourceGroup, SessionSourceSet,
     WalSource,

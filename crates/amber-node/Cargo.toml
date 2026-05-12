@@ -15,4 +15,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 tempfile = "3"

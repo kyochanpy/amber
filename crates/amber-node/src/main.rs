@@ -9,8 +9,8 @@ use std::{
 use amber_core::{
     AmberConfig, RecordBatchMetadata, SchemaCatalogEntry, SessionId, SessionManifest, Storage,
     StorageBackend, WalRotateRequest, WalRotationConfig, WalWriteRequest, WalWriter,
-    WalWriterHandle,
-    normalized_payload_schema, prepend_metadata_columns, schema_fingerprint_for_payload,
+    WalWriterHandle, normalized_payload_schema, prepare_compressed_image_batch,
+    prepend_metadata_columns, schema_fingerprint_for_payload,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::record_batch::RecordBatch;
@@ -195,8 +195,29 @@ impl NodeRuntime {
         }
 
         let payload_batch = dora_data_to_record_batch(data).map_err(InputHandlingError::recoverable)?;
-        let schema_fingerprint =
-            schema_fingerprint_for_payload(payload_batch.schema().as_ref());
+        let prepared_image = prepare_compressed_image_batch(
+            &self.storage,
+            &self.session_manifest.session_id,
+            &stream.node_id,
+            &stream.output_id,
+            &payload_batch,
+        )
+        .await
+        .map_err(|error| {
+            if error.is_recoverable() {
+                InputHandlingError::recoverable(error)
+            } else {
+                InputHandlingError::fatal(error)
+            }
+        })?;
+        let schema_fingerprint = prepared_image
+            .as_ref()
+            .map(|prepared| prepared.schema_fingerprint.clone())
+            .unwrap_or_else(|| schema_fingerprint_for_payload(payload_batch.schema().as_ref()));
+        let normalized_schema = prepared_image
+            .as_ref()
+            .map(|prepared| prepared.normalized_payload_schema.clone())
+            .unwrap_or_else(|| normalized_payload_schema(payload_batch.schema().as_ref()));
 
         let stream_key = stream.schema_key();
         if let Some(existing_schema_fingerprint) = self.stream_schemas.get(&stream_key)
@@ -213,7 +234,7 @@ impl NodeRuntime {
 
         SchemaCatalogEntry::new(
             schema_fingerprint.clone(),
-            normalized_payload_schema(payload_batch.schema().as_ref()),
+            normalized_schema,
         )
         .save_if_absent(&self.storage)
         .await
@@ -225,12 +246,16 @@ impl NodeRuntime {
             ))
         })?;
 
-        let row_count = payload_batch.num_rows();
+        let wal_payload_batch = prepared_image
+            .as_ref()
+            .map(|prepared| prepared.metadata_batch.clone())
+            .unwrap_or_else(|| payload_batch.clone());
+        let row_count = wal_payload_batch.num_rows();
         let amber_timestamp = current_time_nanos()
             .context("failed to compute amber timestamp")
             .map_err(InputHandlingError::fatal)?;
         let enriched_batch = prepend_metadata_columns(
-            &payload_batch,
+            &wal_payload_batch,
             &RecordBatchMetadata::new(
                 self.session_manifest.session_id.as_str(),
                 &stream.node_id,
@@ -726,6 +751,7 @@ mod tests {
     };
     use chrono::Utc;
     use dora_node_api::dora_core::config::{Input, NodeRunConfig, UserInputMapping};
+    use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
     use tempfile::TempDir;
 
     use super::*;
@@ -988,6 +1014,95 @@ amber:
         assert_eq!(batch.schema().field(0).name(), SESSION_ID_COLUMN);
         assert_eq!(batch.schema().field(1).name(), NODE_ID_COLUMN);
         assert_eq!(batch.schema().field(2).name(), OUTPUT_ID_COLUMN);
+    }
+
+    #[tokio::test]
+    async fn handle_input_persists_compressed_images_as_assets_and_writes_metadata_batch() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+  nodes:
+    - id: camera
+      outputs:
+        - id: image
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_image".to_owned(),
+            ConfiguredStream::new("camera", "image", None),
+        );
+
+        let receipt = runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                1_700_000_000_123_456_789,
+                compressed_image_arrow_data(),
+            )
+            .await
+            .expect("image input handling should succeed")
+            .expect("selected image input should produce a WAL receipt");
+
+        let schema_fingerprint = runtime
+            .stream_schemas
+            .get(&StreamSchemaKey {
+                node_id: "camera".to_owned(),
+                output_id: "image".to_owned(),
+            })
+            .expect("stream schema fingerprint should be tracked")
+            .clone();
+        let schema_entry = SchemaCatalogEntry::load(&runtime.storage, &schema_fingerprint)
+            .await
+            .expect("schema entry should load");
+        assert_eq!(
+            schema_entry.normalized_payload_schema.fields[0].metadata["image_format"],
+            "png"
+        );
+
+        let storage = runtime.storage.clone();
+        let mut writer = runtime.writer.take().expect("writer should still be initialized");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown should publish WAL segment");
+
+        let wal_bytes = storage
+            .get_bytes(&receipt.path)
+            .await
+            .expect("published WAL segment should be readable");
+        let mut reader = StreamReader::try_new(std::io::Cursor::new(wal_bytes), None)
+            .expect("WAL IPC reader should open");
+        let batch = reader
+            .next()
+            .expect("one WAL batch should exist")
+            .expect("WAL batch should decode");
+
+        assert_eq!(batch.schema().field(5).name(), "width");
+        assert_eq!(batch.schema().field(9).name(), "asset_relpath");
+        let asset_relpath = batch
+            .column_by_name("asset_relpath")
+            .expect("asset path column should exist")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("asset path column should be utf8")
+            .value(0)
+            .to_owned();
+        assert!(
+            storage
+                .exists(&amber_core::ObjectPath::from(asset_relpath))
+                .await
+                .expect("image asset should exist")
+        );
     }
 
     #[tokio::test]
@@ -1540,5 +1655,35 @@ amber:
 
     fn primitive_arrow_data() -> ArrowData {
         ArrowData(Arc::new(dora_arrow::array::Int32Array::from(vec![1, 2, 3])))
+    }
+
+    fn compressed_image_arrow_data() -> ArrowData {
+        let mut image_field = dora_arrow::datatypes::Field::new(
+            "image",
+            dora_arrow::datatypes::DataType::LargeBinary,
+            false,
+        );
+        image_field.set_metadata(std::collections::HashMap::from([(
+            "image_format".to_owned(),
+            "png".to_owned(),
+        )]));
+
+        let batch = dora_arrow::record_batch::RecordBatch::try_new(
+            Arc::new(dora_arrow::datatypes::Schema::new(vec![image_field])),
+            vec![Arc::new(dora_arrow::array::LargeBinaryArray::from(vec![Some(
+                tiny_png_bytes().as_slice(),
+            )]))],
+        )
+        .expect("compressed image payload should build");
+
+        ArrowData(Arc::new(dora_arrow::array::StructArray::from(batch)))
+    }
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        PngEncoder::new(&mut encoded)
+            .write_image(&[255, 0, 0], 1, 1, ColorType::Rgb8.into())
+            .expect("PNG encoding should succeed");
+        encoded.into_inner()
     }
 }
