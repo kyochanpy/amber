@@ -28,6 +28,7 @@ const SEMANTIC_METADATA_KEYS: &[&str] = &[
     "image_encoding",
     "image_format",
     "image_encoding_kind",
+    "image_quality",
     "semantic_type",
     "tensor_shape",
     "unit",
