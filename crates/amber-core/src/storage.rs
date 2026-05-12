@@ -334,6 +334,22 @@ pub mod paths {
         session_root(session_id).child("manifest.json")
     }
 
+    pub fn session_asset_root(session_id: &str) -> ObjectPath {
+        session_root(session_id).child("assets")
+    }
+
+    pub fn session_asset(
+        session_id: &str,
+        node_id: &str,
+        output_id: &str,
+        file_name: &str,
+    ) -> ObjectPath {
+        session_asset_root(session_id)
+            .child(format!("node_id={node_id}"))
+            .child(format!("output_id={output_id}"))
+            .child(file_name)
+    }
+
     pub fn session_wal_root(session_id: &str) -> ObjectPath {
         ObjectPath::from("wal").child(format!("session_id={session_id}"))
     }
@@ -516,6 +532,11 @@ mod tests {
         assert_eq!(
             paths::session_manifest("20260509_abc123").as_ref(),
             "sessions/session_id=20260509_abc123/manifest.json"
+        );
+        assert_eq!(
+            paths::session_asset("20260509_abc123", "camera/front", "image/raw", "frame.png")
+                .as_ref(),
+            "sessions/session_id=20260509_abc123/assets/node_id=camera%2Ffront/output_id=image%2Fraw/frame.png"
         );
         assert_eq!(
             paths::session_wal_root("20260509_abc123").as_ref(),
