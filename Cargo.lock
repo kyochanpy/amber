@@ -138,6 +138,7 @@ dependencies = [
  "arrow 53.4.0",
  "chrono",
  "dora-node-api",
+ "image",
  "tempfile",
  "tokio",
  "tracing",
