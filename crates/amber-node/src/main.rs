@@ -9,7 +9,7 @@ use std::{
 use amber_core::{
     AmberConfig, RecordBatchMetadata, SchemaCatalogEntry, SessionId, SessionManifest, Storage,
     StorageBackend, WalRotateRequest, WalRotationConfig, WalWriteRequest, WalWriter,
-    WalWriterHandle, normalized_payload_schema, prepare_compressed_image_batch,
+    WalWriterHandle, normalized_payload_schema, prepare_image_batch,
     prepend_metadata_columns, schema_fingerprint_for_payload,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -195,7 +195,7 @@ impl NodeRuntime {
         }
 
         let payload_batch = dora_data_to_record_batch(data).map_err(InputHandlingError::recoverable)?;
-        let prepared_image = prepare_compressed_image_batch(
+        let prepared_image = prepare_image_batch(
             &self.storage,
             &self.session_manifest.session_id,
             &stream.node_id,
@@ -1106,6 +1106,91 @@ amber:
     }
 
     #[tokio::test]
+    async fn handle_input_compresses_raw_images_with_default_jpeg_settings() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+  nodes:
+    - id: camera
+      outputs:
+        - id: image
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_image".to_owned(),
+            ConfiguredStream::new("camera", "image", None),
+        );
+
+        let receipt = runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                1_700_000_000_123_456_789,
+                raw_image_arrow_data(None, None),
+            )
+            .await
+            .expect("raw image input handling should succeed")
+            .expect("selected image input should produce a WAL receipt");
+
+        let schema_fingerprint = runtime
+            .stream_schemas
+            .get(&StreamSchemaKey {
+                node_id: "camera".to_owned(),
+                output_id: "image".to_owned(),
+            })
+            .expect("stream schema fingerprint should be tracked")
+            .clone();
+        let schema_entry = SchemaCatalogEntry::load(&runtime.storage, &schema_fingerprint)
+            .await
+            .expect("schema entry should load");
+        assert_eq!(
+            schema_entry.normalized_payload_schema.fields[0].metadata["image_encoding"],
+            "jpeg"
+        );
+        assert_eq!(
+            schema_entry.normalized_payload_schema.fields[0].metadata["image_quality"],
+            "85"
+        );
+
+        let storage = runtime.storage.clone();
+        let mut writer = runtime.writer.take().expect("writer should still be initialized");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown should publish WAL segment");
+
+        let wal_bytes = storage
+            .get_bytes(&receipt.path)
+            .await
+            .expect("published WAL segment should be readable");
+        let mut reader = StreamReader::try_new(std::io::Cursor::new(wal_bytes), None)
+            .expect("WAL IPC reader should open");
+        let batch = reader
+            .next()
+            .expect("one WAL batch should exist")
+            .expect("WAL batch should decode");
+
+        let format = batch
+            .column_by_name("format")
+            .expect("format column should exist")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("format should be utf8")
+            .value(0);
+        assert_eq!(format, "jpeg");
+    }
+
+    #[tokio::test]
     async fn handle_input_rejects_same_session_schema_changes() {
         let temp_dir = TempDir::new().expect("temp dir should be created");
         let config_path = write_config(
@@ -1675,6 +1760,36 @@ amber:
             )]))],
         )
         .expect("compressed image payload should build");
+
+        ArrowData(Arc::new(dora_arrow::array::StructArray::from(batch)))
+    }
+
+    fn raw_image_arrow_data(encoding: Option<&str>, quality: Option<&str>) -> ArrowData {
+        let mut metadata = std::collections::HashMap::from([
+            ("image_encoding_kind".to_owned(), "raw".to_owned()),
+            ("tensor_shape".to_owned(), "1x2x3".to_owned()),
+        ]);
+        if let Some(encoding) = encoding {
+            metadata.insert("encoding".to_owned(), encoding.to_owned());
+        }
+        if let Some(quality) = quality {
+            metadata.insert("quality".to_owned(), quality.to_owned());
+        }
+
+        let mut image_field = dora_arrow::datatypes::Field::new(
+            "image",
+            dora_arrow::datatypes::DataType::LargeBinary,
+            false,
+        );
+        image_field.set_metadata(metadata);
+
+        let batch = dora_arrow::record_batch::RecordBatch::try_new(
+            Arc::new(dora_arrow::datatypes::Schema::new(vec![image_field])),
+            vec![Arc::new(dora_arrow::array::LargeBinaryArray::from(vec![Some(
+                [255, 0, 0, 0, 255, 0].as_slice(),
+            )]))],
+        )
+        .expect("raw image payload should build");
 
         ArrowData(Arc::new(dora_arrow::array::StructArray::from(batch)))
     }
