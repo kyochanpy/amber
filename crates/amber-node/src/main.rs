@@ -1146,6 +1146,76 @@ amber:
     }
 
     #[tokio::test]
+    async fn handle_input_counts_sampling_independently_per_output() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_image".to_owned(),
+            ConfiguredStream::new("camera", "image", Some(5)),
+        );
+        runtime.selected_inputs.insert(
+            "camera_depth".to_owned(),
+            ConfiguredStream::new("camera", "depth", Some(3)),
+        );
+
+        for node_timestamp in 1..3 {
+            assert!(runtime
+                .handle_input(
+                    DataId::from("camera_image".to_owned()),
+                    node_timestamp,
+                    structured_arrow_data(),
+                )
+                .await
+                .expect("sampled image frame should succeed")
+                .is_none());
+            assert!(runtime
+                .handle_input(
+                    DataId::from("camera_depth".to_owned()),
+                    node_timestamp,
+                    structured_arrow_data(),
+                )
+                .await
+                .expect("sampled depth frame should succeed")
+                .is_none());
+        }
+
+        assert!(runtime
+            .handle_input(DataId::from("camera_depth".to_owned()), 3, structured_arrow_data())
+            .await
+            .expect("third depth frame should succeed")
+            .is_some());
+        assert!(runtime
+            .handle_input(DataId::from("camera_image".to_owned()), 3, structured_arrow_data())
+            .await
+            .expect("third image frame should succeed")
+            .is_none());
+        assert!(runtime
+            .handle_input(DataId::from("camera_image".to_owned()), 4, structured_arrow_data())
+            .await
+            .expect("fourth image frame should succeed")
+            .is_none());
+        assert!(runtime
+            .handle_input(DataId::from("camera_image".to_owned()), 5, structured_arrow_data())
+            .await
+            .expect("fifth image frame should succeed")
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn handle_input_without_sampling_records_every_frame() {
         let temp_dir = TempDir::new().expect("temp dir should be created");
         let config_path = write_config(
