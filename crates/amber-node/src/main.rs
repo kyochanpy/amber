@@ -9,6 +9,7 @@ use std::{
 use amber_core::{
     AmberConfig, RecordBatchMetadata, SchemaCatalogEntry, SessionId, SessionManifest, Storage,
     StorageBackend, WalRotateRequest, WalRotationConfig, WalWriteRequest, WalWriter,
+    WalWriterHandle,
     normalized_payload_schema, prepend_metadata_columns, schema_fingerprint_for_payload,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -76,7 +77,7 @@ struct NodeRuntime {
     config: AmberConfig,
     storage: Storage,
     session_manifest: SessionManifest,
-    writer: Arc<WalWriter>,
+    writer: Option<WalWriter>,
     rotation_runtime: Option<WalRotationRuntime>,
     #[allow(dead_code)]
     staging_root: PathBuf,
@@ -102,11 +103,8 @@ impl NodeRuntime {
                     config_path.display()
                 )
             })?;
-        let writer = Arc::new(WalWriter::spawn_local(
-            storage.clone(),
-            staging_root.clone(),
-        ));
-        let rotation_runtime = WalRotationRuntime::start(&config, Arc::clone(&writer))
+        let writer = WalWriter::spawn_local(storage.clone(), staging_root.clone());
+        let rotation_runtime = WalRotationRuntime::start(&config, writer.handle())
             .context("failed to initialize WAL rotation runtime")?;
 
         Ok(Self {
@@ -114,7 +112,7 @@ impl NodeRuntime {
             config,
             storage,
             session_manifest,
-            writer,
+            writer: Some(writer),
             rotation_runtime,
             staging_root,
             selected_inputs: HashMap::new(),
@@ -234,7 +232,11 @@ impl NodeRuntime {
             rotation_runtime.record_write(&request).await;
         }
 
-        let receipt = self.writer.write(request).await.map_err(|source| {
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| InputHandlingError::fatal(anyhow!("WAL writer is unavailable")))?;
+        let receipt = writer.write(request).await.map_err(|source| {
             InputHandlingError::fatal(anyhow!(
                 "failed to write WAL batch for node '{}' output '{}': {source}",
                 stream.node_id,
@@ -494,13 +496,13 @@ struct WalRotationRuntime {
 
 #[allow(dead_code)]
 impl WalRotationRuntime {
-    fn start(config: &AmberConfig, writer: Arc<WalWriter>) -> Result<Option<Self>> {
+    fn start(config: &AmberConfig, writer: WalWriterHandle) -> Result<Option<Self>> {
         Self::from_rotation_config(&config.wal.rotation, writer)
     }
 
     fn from_rotation_config(
         rotation: &WalRotationConfig,
-        writer: Arc<WalWriter>,
+        writer: WalWriterHandle,
     ) -> Result<Option<Self>> {
         if rotation.max_size_mb != WalRotationConfig::DEFAULT_MAX_SIZE_MB {
             bail!(
@@ -520,7 +522,7 @@ impl WalRotationRuntime {
         )))
     }
 
-    fn spawn(interval_duration: Duration, writer: Arc<WalWriter>) -> Self {
+    fn spawn(interval_duration: Duration, writer: WalWriterHandle) -> Self {
         let active_streams = Arc::new(tokio::sync::Mutex::new(HashSet::<ActiveWalStream>::new()));
         let streams_for_task = Arc::clone(&active_streams);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
@@ -650,6 +652,8 @@ amber:
         );
         runtime
             .writer
+            .as_ref()
+            .expect("writer should be initialized")
             .flush()
             .await
             .expect("writer should accept startup flush");
@@ -815,14 +819,8 @@ amber:
             .expect("schema catalog entry should load");
         assert_eq!(schema_entry.schema_fingerprint, schema_fingerprint);
 
-        let writer = Arc::clone(&runtime.writer);
         let storage = runtime.storage.clone();
-        drop(runtime);
-
-        let mut writer = match Arc::try_unwrap(writer) {
-            Ok(writer) => writer,
-            Err(_) => panic!("writer should be uniquely owned"),
-        };
+        let mut writer = runtime.writer.take().expect("writer should still be initialized");
         writer
             .shutdown()
             .await
@@ -901,18 +899,18 @@ amber:
 
     #[tokio::test]
     async fn rotation_runtime_rejects_non_default_size_policy() {
-        let writer = Arc::new(WalWriter::spawn_local(
+        let writer = WalWriter::spawn_local(
             Storage::new_local(TempDir::new().expect("storage dir").path(), None::<&str>)
                 .expect("storage"),
             TempDir::new().expect("staging dir").path(),
-        ));
+        );
 
         let error = WalRotationRuntime::from_rotation_config(
             &WalRotationConfig {
                 max_size_mb: 64,
                 max_duration_sec: 1,
             },
-            writer,
+            writer.handle(),
         )
         .expect_err("non-default size rotation should be rejected");
 
@@ -938,8 +936,8 @@ amber:
         .await
         .expect("manifest should be created");
 
-        let writer = Arc::new(WalWriter::spawn_local(storage.clone(), staging_dir.path()));
-        let mut runtime = WalRotationRuntime::spawn(Duration::from_millis(50), Arc::clone(&writer));
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        let mut runtime = WalRotationRuntime::spawn(Duration::from_millis(50), writer.handle());
 
         let first_request = WalWriteRequest::new(
             session_id.clone(),
@@ -989,10 +987,6 @@ amber:
         assert_ne!(first_receipt.segment_id, second_receipt.segment_id);
         assert_ne!(first_receipt.path, second_receipt.path);
 
-        let mut writer = match Arc::try_unwrap(writer) {
-            Ok(writer) => writer,
-            Err(_) => panic!("writer should not have remaining shared references"),
-        };
         writer
             .shutdown()
             .await
