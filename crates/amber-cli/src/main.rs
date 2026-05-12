@@ -5,9 +5,9 @@ use std::{
 
 use amber_core::{
     AMBER_TIMESTAMP_COLUMN, AmberConfig, CatalogState, Compactor, FoldedWalSegmentState,
-    NODE_TIMESTAMP_COLUMN, ObjectPath, SESSION_ID_COLUMN, SessionId, SessionManifest,
-    SessionSourceFilter, SessionSourceGroup, SessionSourceSet, SessionStatus, Storage,
-    StorageBackend, is_metadata_column,
+    NODE_ID_COLUMN, NODE_TIMESTAMP_COLUMN, OUTPUT_ID_COLUMN, ObjectPath, SESSION_ID_COLUMN,
+    SessionId, SessionManifest, SessionSourceFilter, SessionSourceGroup, SessionSourceSet,
+    SessionStatus, Storage, StorageBackend, is_metadata_column,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
@@ -98,6 +98,16 @@ struct InspectSelection {
     session_id: SessionId,
     node_id: Option<String>,
     output_id: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InspectRow {
+    entity_path: String,
+    amber_row_index: i64,
+    node_timestamp: i64,
+    amber_timestamp: i64,
+    text: String,
 }
 
 #[tokio::main]
@@ -250,9 +260,15 @@ async fn run_inspect(args: &InspectArgs) -> Result<()> {
     }
 
     let recording = build_rerun_recording(&selection, args.blueprint.as_deref())?;
-    for group in &source_set.groups {
-        inspect_group_to_rerun(&storage, &recording, &selection.session_id, group).await?;
-    }
+    for_each_inspect_batch(
+        &storage,
+        &selection.session_id,
+        &source_set,
+        |group, batch, amber_row_index| {
+            log_batch_to_rerun(&recording, group, batch, amber_row_index)
+        },
+    )
+    .await?;
     recording.flush_blocking();
 
     Ok(())
@@ -365,14 +381,55 @@ fn build_rerun_recording(
         )
 }
 
-async fn inspect_group_to_rerun(
+#[cfg(test)]
+async fn collect_inspect_rows(
     storage: &Storage,
-    recording: &RecordingStream,
+    session_id: &SessionId,
+    source_set: &SessionSourceSet,
+) -> Result<Vec<InspectRow>> {
+    let mut rows = Vec::new();
+    for_each_inspect_batch(storage, session_id, source_set, |group, batch, amber_row_index| {
+        append_batch_inspect_rows(group, batch, amber_row_index, &mut rows)
+    })
+    .await?;
+
+    Ok(rows)
+}
+
+async fn for_each_inspect_batch<F>(
+    storage: &Storage,
+    session_id: &SessionId,
+    source_set: &SessionSourceSet,
+    mut handle_batch: F,
+) -> Result<()>
+where
+    F: FnMut(&SessionSourceGroup, &RecordBatch, &mut i64) -> Result<()>,
+{
+    for group in &source_set.groups {
+        let mut amber_row_index = 0_i64;
+        for_each_group_inspect_batch(
+            storage,
+            session_id,
+            group,
+            &mut amber_row_index,
+            &mut handle_batch,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn for_each_group_inspect_batch<F>(
+    storage: &Storage,
     session_id: &SessionId,
     group: &SessionSourceGroup,
-) -> Result<()> {
-    let mut amber_row_index = 0_i64;
-
+    amber_row_index: &mut i64,
+    handle_batch: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&SessionSourceGroup, &RecordBatch, &mut i64) -> Result<()>,
+{
     for source in &group.parquet_sources {
         let bytes = storage
             .get_bytes(&source.path)
@@ -400,7 +457,7 @@ async fn inspect_group_to_rerun(
             if filtered.num_rows() == 0 {
                 continue;
             }
-            log_batch_to_rerun(recording, group, &filtered, &mut amber_row_index)?;
+            handle_batch(group, &filtered, amber_row_index)?;
         }
     }
 
@@ -419,7 +476,7 @@ async fn inspect_group_to_rerun(
                     source.path
                 )
             })?;
-            log_batch_to_rerun(recording, group, &batch, &mut amber_row_index)?;
+            handle_batch(group, &batch, amber_row_index)?;
         }
     }
 
@@ -463,6 +520,31 @@ fn log_batch_to_rerun(
             .with_context(|| {
                 format!("failed to log row {row_index} to rerun entity '{entity_path}'")
             })?;
+        *amber_row_index += 1;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+fn append_batch_inspect_rows(
+    group: &SessionSourceGroup,
+    batch: &RecordBatch,
+    amber_row_index: &mut i64,
+    rows: &mut Vec<InspectRow>,
+) -> Result<()> {
+    let entity_path = format!("{}/{}", group.node_id, group.output_id);
+    let node_timestamps = typed_column::<arrow::array::Int64Array>(batch, NODE_TIMESTAMP_COLUMN)?;
+    let amber_timestamps = typed_column::<arrow::array::Int64Array>(batch, AMBER_TIMESTAMP_COLUMN)?;
+
+    for row_index in 0..batch.num_rows() {
+        rows.push(InspectRow {
+            entity_path: entity_path.clone(),
+            amber_row_index: *amber_row_index,
+            node_timestamp: node_timestamps.value(row_index),
+            amber_timestamp: amber_timestamps.value(row_index),
+            text: render_row_text(batch, row_index)?,
+        });
         *amber_row_index += 1;
     }
 
@@ -1293,6 +1375,259 @@ mod tests {
         }
 
         assert_eq!(labels, vec!["session-a".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn mvp_happy_path_flows_from_wal_to_compaction_to_inspect_rows() {
+        let storage_dir = TempDir::new().expect("storage dir should exist");
+        let staging_dir = TempDir::new().expect("staging dir should exist");
+        let config_path = write_config(storage_dir.path()).expect("config should be written");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+
+        let session_id = SessionId::new();
+        SessionManifest::create(
+            &storage,
+            session_id.clone(),
+            chrono::Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch_for_stream(
+                    session_id.as_str(),
+                    "camera",
+                    "image",
+                    vec![1],
+                    vec![Some("first")],
+                    vec![100],
+                    vec![110],
+                ),
+            ))
+            .await
+            .expect("first WAL write should succeed");
+        writer
+            .rotate(amber_core::WalRotateRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+            ))
+            .await
+            .expect("rotation should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+                "schema-v1",
+                metadata_enriched_batch_for_stream(
+                    session_id.as_str(),
+                    "camera",
+                    "image",
+                    vec![2],
+                    vec![Some("second")],
+                    vec![200],
+                    vec![210],
+                ),
+            ))
+            .await
+            .expect("second WAL write should succeed");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown should publish remaining WAL");
+
+        let manifest = SessionManifest::load(&storage, &session_id)
+            .await
+            .expect("session manifest should load after writer shutdown");
+        assert_eq!(manifest.observed_streams.len(), 1);
+
+        let summary = run_compact(&CompactArgs {
+            config: config_path,
+            cleanup: false,
+        })
+        .await
+        .expect("compact command should succeed");
+        assert_eq!(summary.compacted_segments, 2);
+        assert_eq!(summary.created_parquet_files, 1);
+        assert_eq!(summary.deleted_segments, 0);
+
+        let catalog_events = CatalogEvent::list(&storage)
+            .await
+            .expect("catalog events should load");
+        assert_eq!(
+            catalog_events
+                .iter()
+                .filter(|event| matches!(event, CatalogEvent::WalSegmentClosed(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            catalog_events
+                .iter()
+                .filter(|event| matches!(event, CatalogEvent::CompactionCommitted(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            storage
+                .list_prefix(&ObjectPath::from("catalog/events"))
+                .await
+                .expect("catalog event objects should list")
+                .len(),
+            3
+        );
+
+        let source_set =
+            SessionSourceSet::resolve(&storage, &session_id, SessionSourceFilter::default())
+                .await
+                .expect("source set should resolve");
+        assert_eq!(source_set.groups.len(), 1);
+        assert!(source_set.groups[0].wal_sources.is_empty());
+        assert_eq!(source_set.groups[0].parquet_sources.len(), 1);
+
+        let parquet_path = source_set.groups[0].parquet_sources[0].path.clone();
+        let bytes = storage
+            .get_bytes(&parquet_path)
+            .await
+            .expect("parquet bytes should be readable");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
+            .expect("parquet builder should open")
+            .build()
+            .expect("parquet reader should build");
+        let first_batch = reader
+            .next()
+            .expect("parquet should contain one batch")
+            .expect("parquet batch should decode");
+        for column_name in [
+            SESSION_ID_COLUMN,
+            NODE_ID_COLUMN,
+            OUTPUT_ID_COLUMN,
+            NODE_TIMESTAMP_COLUMN,
+            AMBER_TIMESTAMP_COLUMN,
+        ] {
+            assert!(
+                first_batch.column_by_name(column_name).is_some(),
+                "parquet batch should include metadata column '{column_name}'"
+            );
+        }
+
+        let rows = collect_inspect_rows(&storage, &session_id, &source_set)
+            .await
+            .expect("inspect rows should collect");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.entity_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["camera/image", "camera/image"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.amber_row_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        // The compactor sorts source segments by WalSegmentId before writing each part, and those
+        // IDs are UUIDv7 values. That keeps the compacted rows in the same chronological order as
+        // the two WAL rotations created above, so the rendered inspect text remains stable here.
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            vec!["value=1, label=first", "value=2, label=second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_row_indices_restart_for_each_group() {
+        let storage_dir = TempDir::new().expect("storage dir should exist");
+        let staging_dir = TempDir::new().expect("staging dir should exist");
+        let storage = Storage::new_local(storage_dir.path(), None::<&str>).expect("storage");
+
+        let session_id = SessionId::new();
+        SessionManifest::create(
+            &storage,
+            session_id.clone(),
+            chrono::Utc::now(),
+            AmberConfig::default(),
+        )
+        .await
+        .expect("session manifest should be created");
+
+        let mut writer = WalWriter::spawn_local(storage.clone(), staging_dir.path());
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+                "schema-camera",
+                metadata_enriched_batch_for_stream(
+                    session_id.as_str(),
+                    "camera",
+                    "image",
+                    vec![1],
+                    vec![Some("camera-row")],
+                    vec![100],
+                    vec![110],
+                ),
+            ))
+            .await
+            .expect("camera write should succeed");
+        writer
+            .rotate(amber_core::WalRotateRequest::new(
+                session_id.clone(),
+                "camera",
+                "image",
+            ))
+            .await
+            .expect("camera rotation should succeed");
+        writer
+            .write(WalWriteRequest::new(
+                session_id.clone(),
+                "joint_states",
+                "state",
+                "schema-joints",
+                metadata_enriched_batch_for_stream(
+                    session_id.as_str(),
+                    "joint_states",
+                    "state",
+                    vec![2],
+                    vec![Some("joint-row")],
+                    vec![200],
+                    vec![210],
+                ),
+            ))
+            .await
+            .expect("joint write should succeed");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown should publish remaining WAL");
+
+        let source_set =
+            SessionSourceSet::resolve(&storage, &session_id, SessionSourceFilter::default())
+                .await
+                .expect("source set should resolve");
+        assert_eq!(source_set.groups.len(), 2);
+
+        let rows = collect_inspect_rows(&storage, &session_id, &source_set)
+            .await
+            .expect("inspect rows should collect");
+        assert_eq!(rows.len(), 2);
+        // SessionSourceSet groups are returned in key order (node_id/output_id/schema), so the
+        // camera stream sorts before joint_states and appears first in the collected rows.
+        assert_eq!(
+            rows.iter().map(|row| row.entity_path.as_str()).collect::<Vec<_>>(),
+            vec!["camera/image", "joint_states/state"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.amber_row_index).collect::<Vec<_>>(),
+            vec![0, 0]
+        );
     }
 
     struct CreatedManifest {
