@@ -95,6 +95,7 @@ struct NodeRuntime {
     #[allow(dead_code)]
     staging_root: PathBuf,
     selected_inputs: HashMap<String, ConfiguredStream>,
+    frame_counters: HashMap<StreamSchemaKey, u64>,
     stream_schemas: HashMap<StreamSchemaKey, String>,
 }
 
@@ -129,6 +130,7 @@ impl NodeRuntime {
             rotation_runtime,
             staging_root,
             selected_inputs: HashMap::new(),
+            frame_counters: HashMap::new(),
             stream_schemas: HashMap::new(),
         })
     }
@@ -188,6 +190,9 @@ impl NodeRuntime {
         let Some(stream) = self.selected_inputs.get(&input_id).cloned() else {
             return Ok(None);
         };
+        if !should_record_frame(&mut self.frame_counters, &stream) {
+            return Ok(None);
+        }
 
         let payload_batch = dora_data_to_record_batch(data).map_err(InputHandlingError::recoverable)?;
         let schema_fingerprint =
@@ -409,13 +414,19 @@ fn prepare_staging_root(
 struct ConfiguredStream {
     node_id: String,
     output_id: String,
+    every_n_frames: Option<u64>,
 }
 
 impl ConfiguredStream {
-    fn new(node_id: impl Into<String>, output_id: impl Into<String>) -> Self {
+    fn new(
+        node_id: impl Into<String>,
+        output_id: impl Into<String>,
+        every_n_frames: Option<u64>,
+    ) -> Self {
         Self {
             node_id: node_id.into(),
             output_id: output_id.into(),
+            every_n_frames,
         }
     }
 
@@ -425,6 +436,22 @@ impl ConfiguredStream {
             output_id: self.output_id.clone(),
         }
     }
+}
+
+fn should_record_frame(
+    frame_counters: &mut HashMap<StreamSchemaKey, u64>,
+    stream: &ConfiguredStream,
+) -> bool {
+    let Some(every_n_frames) = stream.every_n_frames else {
+        return true;
+    };
+    if every_n_frames <= 1 {
+        return true;
+    }
+
+    let frame_count = frame_counters.entry(stream.schema_key()).or_insert(0);
+    *frame_count += 1;
+    (*frame_count).is_multiple_of(every_n_frames)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -461,8 +488,8 @@ fn build_selected_inputs(
                 node.id.clone(),
                 node.outputs
                     .iter()
-                    .map(|output| output.id.clone())
-                    .collect::<HashSet<_>>(),
+                    .map(|output| (output.id.clone(), output.every_n_frames))
+                    .collect::<HashMap<_, _>>(),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -478,9 +505,12 @@ fn build_selected_inputs(
             let node_id = mapping.source.to_string();
             let output_id = mapping.output.to_string();
             let outputs = selected_outputs.get(&node_id)?;
-            outputs
-                .contains(&output_id)
-                .then(|| (input_id.to_string(), ConfiguredStream::new(node_id, output_id)))
+            outputs.get(&output_id).map(|every_n_frames| {
+                (
+                    input_id.to_string(),
+                    ConfiguredStream::new(node_id, output_id, *every_n_frames),
+                )
+            })
         })
         .collect()
 }
@@ -839,8 +869,42 @@ amber:
             selected,
             HashMap::from([(
                 "camera_image".to_owned(),
-                ConfiguredStream::new("camera", "image"),
+                ConfiguredStream::new("camera", "image", None),
             )])
+        );
+    }
+
+    #[test]
+    fn build_selected_inputs_preserves_every_n_frames() {
+        let config = AmberConfig {
+            nodes: vec![amber_core::NodeConfig {
+                id: "camera".to_owned(),
+                outputs: vec![amber_core::OutputConfig {
+                    id: "image".to_owned(),
+                    every_n_frames: Some(5),
+                }],
+            }],
+            ..AmberConfig::default()
+        };
+        let node_config = NodeRunConfig {
+            inputs: BTreeMap::from([(
+                DataId::from("camera_image".to_owned()),
+                Input {
+                    mapping: InputMapping::User(UserInputMapping {
+                        source: "camera".to_owned().into(),
+                        output: "image".to_owned().into(),
+                    }),
+                    queue_size: None,
+                },
+            )]),
+            outputs: BTreeSet::new(),
+        };
+
+        let selected = build_selected_inputs(&config, &node_config);
+
+        assert_eq!(
+            selected.get("camera_image"),
+            Some(&ConfiguredStream::new("camera", "image", Some(5)))
         );
     }
 
@@ -950,7 +1014,7 @@ amber:
             .expect("startup should succeed");
         runtime.selected_inputs.insert(
             "camera_image".to_owned(),
-            ConfiguredStream::new("camera", "image"),
+            ConfiguredStream::new("camera", "image", None),
         );
 
         runtime
@@ -978,6 +1042,142 @@ amber:
             InputHandlingError::Recoverable(error) => {
                 panic!("expected fatal schema change error, got recoverable: {error}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_input_samples_every_nth_frame() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+  nodes:
+    - id: camera
+      outputs:
+        - id: image
+          every_n_frames: 5
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_image".to_owned(),
+            ConfiguredStream::new("camera", "image", Some(5)),
+        );
+
+        for node_timestamp in 1..5 {
+            let receipt = runtime
+                .handle_input(
+                    DataId::from("camera_image".to_owned()),
+                    node_timestamp,
+                    structured_arrow_data(),
+                )
+                .await
+                .expect("sampled input handling should succeed");
+            assert!(receipt.is_none(), "only the fifth frame should be recorded");
+        }
+
+        let receipt = runtime
+            .handle_input(
+                DataId::from("camera_image".to_owned()),
+                5,
+                structured_arrow_data(),
+            )
+            .await
+            .expect("fifth frame handling should succeed");
+        assert!(receipt.is_some(), "the fifth frame should be recorded");
+    }
+
+    #[tokio::test]
+    async fn handle_input_counts_sampling_independently_per_node() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_a".to_owned(),
+            ConfiguredStream::new("camera-a", "image", Some(2)),
+        );
+        runtime.selected_inputs.insert(
+            "camera_b".to_owned(),
+            ConfiguredStream::new("camera-b", "image", Some(2)),
+        );
+
+        assert!(runtime
+            .handle_input(DataId::from("camera_a".to_owned()), 1, structured_arrow_data())
+            .await
+            .expect("first node-a frame should succeed")
+            .is_none());
+        assert!(runtime
+            .handle_input(DataId::from("camera_b".to_owned()), 1, structured_arrow_data())
+            .await
+            .expect("first node-b frame should succeed")
+            .is_none());
+        assert!(runtime
+            .handle_input(DataId::from("camera_a".to_owned()), 2, structured_arrow_data())
+            .await
+            .expect("second node-a frame should succeed")
+            .is_some());
+        assert!(runtime
+            .handle_input(DataId::from("camera_b".to_owned()), 2, structured_arrow_data())
+            .await
+            .expect("second node-b frame should succeed")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn handle_input_without_sampling_records_every_frame() {
+        let temp_dir = TempDir::new().expect("temp dir should be created");
+        let config_path = write_config(
+            temp_dir.path(),
+            r#"
+amber:
+  storage:
+    backend: local
+    path: ./amber_data
+  wal:
+    rotation:
+      max_duration_sec: 0
+"#,
+        );
+        let mut runtime = NodeRuntime::initialize_from_path(&config_path)
+            .await
+            .expect("startup should succeed");
+        runtime.selected_inputs.insert(
+            "camera_image".to_owned(),
+            ConfiguredStream::new("camera", "image", None),
+        );
+
+        for node_timestamp in 1..=3 {
+            let receipt = runtime
+                .handle_input(
+                    DataId::from("camera_image".to_owned()),
+                    node_timestamp,
+                    structured_arrow_data(),
+                )
+                .await
+                .expect("unsampled input handling should succeed");
+            assert!(receipt.is_some(), "all frames should be recorded without sampling");
         }
     }
 
